@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dsdvc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dsdvc}
+      POSTGRES_DB: dsdvc
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dsdvc"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.3
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes: [mlflow:/mlflow]
+    ports: ["5000:5000"]
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsdvc}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-dsdvc-secret}
+    volumes: [minio:/data]
+    ports: ["9000:9000", "9001:9001"]
+  api:
+    build: .
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://dsdvc:${POSTGRES_PASSWORD:-dsdvc}@db:5432/dsdvc
+      REDIS_URL: redis://redis:6379/0
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      S3_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    ports: ["8000:8000"]
+  dashboard:
+    build: .
+    env_file: [.env]
+    command: ["streamlit", "run", "dashboard/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://dsdvc:${POSTGRES_PASSWORD:-dsdvc}@db:5432/dsdvc
+    depends_on: [api]
+    ports: ["8501:8501"]
+volumes:
+  pgdata: {}
+  mlflow: {}
+  minio: {}

@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.0
+networkx>=3.0
+scipy>=1.11
+plotly>=5.18
+streamlit>=1.35
