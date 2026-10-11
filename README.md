@@ -70,7 +70,7 @@ Verified on 2026-10-09 (macOS, Python 3.12):
 | Criterion | Status |
 |---|---|
 | clean installation works | ✅ fresh venv from `requirements.txt`, full suite passes |
-| tests pass | ✅ 81 passed |
+| tests pass | ✅ 81 passed locally; CI on Python 3.11 + 3.12: 79 passed, 2 skipped (legacy golden values recorded on a different numpy build; checksum and mechanics tests still run) |
 | baseline (legacy) model runs | ✅ v2 + v3 byte-identical to originals (SHA-256), golden-output regression tests |
 | calibration works | ✅ Bass NLS/MLE/MCMC recover planted p, q, m; ABC recovers identifiable parameters and flags weakly identified ones |
 | real/authorised data connectors work where credentials exist | ⚠️ implemented against Meta's documented Graph API and tested with mocked HTTP; **not exercised against live Meta accounts** (no credentials here) |
@@ -78,7 +78,7 @@ Verified on 2026-10-09 (macOS, Python 3.12):
 | network / influencer / content / virality / conversion / churn / forecasting / counterfactual | ✅ each covered by tests that check recovery of planted effects |
 | dashboard works | ✅ all 22 tabs render with 0 exceptions (verified in browser) |
 | API works | ✅ verified live under uvicorn plus TestClient tests (auth, roles, revocation, versioned outputs) |
-| Docker works | ⚠️ `docker compose config` validates; **image not built here** (Docker daemon not running) |
+| Docker works | ✅ image built, pushed to `ghcr.io/codex0786/dsdvc-platform` and smoke-tested (`/health`) by GitHub Actions; compose file validates |
 | documentation, model card, provenance, uncertainty intervals, reproducibility | ✅ (simulations are bit-for-bit reproducible: identical result hashes) |
 
 ## Honest limitations
