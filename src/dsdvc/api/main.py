@@ -48,6 +48,11 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def T_audit(db, user, workspace_id, action, **detail):
+    from dsdvc.tenancy.access import audit
+    audit(db, user, workspace_id, action, **detail)
+
+
 def meta(data_version: str = "request") -> dict:
     return {"model_version": MODEL_VERSION, "simulation_version": SIMULATION_VERSION, "data_version": data_version,
             "timestamp": _now()}
@@ -77,20 +82,45 @@ def get_db():
         db.close()
 
 
-def current_user(x_api_key: str | None = Header(default=None), db=Depends(get_db)) -> User:
-    if not x_api_key:
-        raise HTTPException(401, "missing X-API-Key")
-    u = A.verify_api_key(db, x_api_key)
-    if u is None:
-        raise HTTPException(401, "invalid API key")
-    return u
+def current_user(x_api_key: str | None = Header(default=None), authorization: str | None = Header(default=None),
+                 db=Depends(get_db)) -> User:
+    """API keys (service accounts) via X-API-Key, or SSO session tokens via Authorization: Bearer."""
+    from dsdvc.tenancy import sessions
+    if x_api_key:
+        u = A.verify_api_key(db, x_api_key)
+        if u is None:
+            raise HTTPException(401, "invalid API key")
+        return u
+    if authorization and authorization.lower().startswith("bearer "):
+        u = sessions.verify(db, authorization.split(" ", 1)[1].strip())
+        if u is None:
+            raise HTTPException(401, "invalid or expired session")
+        return u
+    raise HTTPException(401, "missing credentials (X-API-Key or Authorization: Bearer)")
 
 
 def require(role: str):
+    """Organisation-level role, for endpoints that never touch client data (synthetic simulation, text tools)."""
     def dep(u: User = Depends(current_user)) -> User:
         if not A.has_role(u, role):
             raise HTTPException(403, f"requires role '{role}'")
         return u
+    return dep
+
+
+def in_workspace(min_role: str = "viewer"):
+    """Client-data endpoints: the X-Workspace-Id header selects the client workspace; membership and role
+    are checked on every request. Unknown and forbidden workspaces both return 404."""
+    from dsdvc.tenancy import access as T
+
+    def dep(x_workspace_id: int | None = Header(default=None), u: User = Depends(current_user), db=Depends(get_db)):
+        try:
+            ws, role = T.require(db, u, x_workspace_id, min_role)
+        except T.NotFound:
+            raise HTTPException(404, "workspace not found (send X-Workspace-Id for a workspace you belong to)")
+        except T.Forbidden as e:
+            raise HTTPException(403, str(e))
+        return u, ws, role
     return dep
 
 
@@ -110,55 +140,189 @@ def literature():
     return LITERATURE
 
 
-# ------------------------------------------------------------------ admin
-class OrgIn(BaseModel):
-    name: str
+# ------------------------------------------------------------------ single sign-on (OIDC)
+def _oidc(provider: str):
+    from dsdvc.tenancy.oidc import OIDCClient, configured_providers
+    from dsdvc.connectors.credentials import lookup
+    provs = configured_providers()
+    if provider not in provs:
+        raise HTTPException(404, "unknown sign-in provider")
+    base = (lookup("DSDVC_PUBLIC_URL") or "http://localhost:8000").rstrip("/")
+    return OIDCClient(provs[provider], f"{base}/auth/oidc/{provider}/callback"), provs[provider]
 
 
+@app.get("/auth/providers")
+def auth_providers():
+    from dsdvc.tenancy.oidc import configured_providers
+    return {"providers": sorted(configured_providers())}
+
+
+@app.get("/auth/oidc/{provider}/login")
+def auth_login(provider: str):
+    from fastapi.responses import RedirectResponse
+    client, _ = _oidc(provider)
+    url, _state = client.authorization_url()
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/auth/oidc/{provider}/callback")
+def auth_callback(provider: str, code: str | None = None, state: str | None = None, error: str | None = None,
+                  db=Depends(get_db)):
+    from dsdvc.tenancy import sessions
+    from dsdvc.tenancy.identity import resolve_user
+    from dsdvc.tenancy.oidc import claims_identity
+    if error or not code or not state:
+        raise HTTPException(400, f"sign-in was not completed: {error or 'missing code/state'}")
+    client, prov = _oidc(provider)
+    try:
+        claims = client.exchange(code, state)
+    except Exception as e:  # noqa: BLE001 - never leak tokens; message only
+        METRICS.inc("dsdvc_login_failures", provider=provider)
+        raise HTTPException(401, f"sign-in failed: {e}")
+    res = resolve_user(db, provider=provider, trust_email=prov.trust_email, **claims_identity(claims))
+    if res.user is None:
+        METRICS.inc("dsdvc_login_denied", provider=provider)
+        raise HTTPException(403, res.reason)
+    token = sessions.issue(res.user)
+    return {"token_type": "Bearer", "access_token": token, "expires_in": int(sessions.DEFAULT_TTL.total_seconds()),
+            "user": {"email": res.user.email, "new_account": res.created}}
+
+
+@app.post("/auth/logout")
+def auth_logout(u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import sessions
+    sessions.revoke_all(db, u)
+    return {"signed_out": True, "note": "all session tokens for this user are now invalid"}
+
+
+@app.get("/me")
+def me(u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    return {"id": u.id, "email": u.email, "role": u.role, "organization_id": u.organization_id,
+            "workspaces": [{"id": w.id, "name": w.name, "slug": w.slug, "role": r} for w, r in T.visible_workspaces(db, u)]}
+
+
+# ------------------------------------------------------------------ organisation admin (own organisation only)
 class UserIn(BaseModel):
     email: str
-    organization: str
-    role: Literal["admin", "analyst", "viewer"] = "viewer"
+    role: Literal["admin", "analyst", "viewer", "member"] = "member"
 
 
-class ProjectIn(BaseModel):
-    organization: str
-    name: str
-    description: str | None = None
-
-
-@app.post("/admin/organizations")
-def create_org(body: OrgIn, u: User = Depends(require("admin")), db=Depends(get_db)):
-    o = A.create_org(db, body.name)
-    return {"id": o.id, "name": o.name}
+class DomainsIn(BaseModel):
+    allowed_email_domains: list[str]
 
 
 @app.post("/admin/users")
 def create_user(body: UserIn, u: User = Depends(require("admin")), db=Depends(get_db)):
-    org = A.create_org(db, body.organization)
-    nu = A.create_user(db, body.email, org, body.role)
+    """Create a user (typically an API service account) in the caller's own organisation."""
+    org = db.get(Organization, u.organization_id)
+    if db.scalar(select(User).where(User.email == body.email.strip().lower())):
+        raise HTTPException(409, "a user with this email already exists")
+    nu = A.create_user(db, body.email.strip().lower(), org, body.role)
     key = A.issue_api_key(db, nu)
-    db.add(AuditLog(user_id=u.id, action="user_created", detail={"email": body.email, "role": body.role}))
+    db.add(AuditLog(user_id=u.id, action="user_created", detail={"email": nu.email, "role": body.role}))
     db.commit()
     return {"id": nu.id, "email": nu.email, "role": nu.role, "api_key": key,
-            "note": "Store this key now; only its hash is kept."}
+            "note": "Store this key now; only its hash is kept. Grant workspace access with /workspaces/{id}/members."}
 
 
-@app.post("/admin/projects")
-def create_project(body: ProjectIn, u: User = Depends(require("admin")), db=Depends(get_db)):
-    org = A.create_org(db, body.organization)
-    p = A.create_project(db, org, body.name, body.description)
-    return {"id": p.id, "name": p.name}
+@app.put("/admin/organization/sso")
+def set_sso_domains(body: DomainsIn, u: User = Depends(require("admin")), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    try:
+        return {"allowed_email_domains": T.set_allowed_domains(db, u, body.allowed_email_domains)}
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @app.delete("/admin/api-keys/{prefix}")
 def revoke(prefix: str, u: User = Depends(require("admin")), db=Depends(get_db)):
+    from dsdvc.database.models import ApiKey
+    key = db.scalar(select(ApiKey).where(ApiKey.prefix == prefix))
+    owner = db.get(User, key.user_id) if key else None
+    if owner is None or owner.organization_id != u.organization_id:
+        raise HTTPException(404, "key not found")
     return {"revoked": A.revoke_api_key(db, prefix)}
 
 
-@app.get("/me")
-def me(u: User = Depends(current_user)):
-    return {"id": u.id, "email": u.email, "role": u.role, "organization_id": u.organization_id}
+# ------------------------------------------------------------------ workspaces (client separation)
+class WorkspaceIn(BaseModel):
+    name: str
+    description: str | None = None
+    slug: str | None = None
+
+
+class MemberIn(BaseModel):
+    email: str
+    role: Literal["admin", "analyst", "viewer"]
+
+
+@app.get("/workspaces")
+def list_workspaces(u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    return [{"id": w.id, "name": w.name, "slug": w.slug, "role": r} for w, r in T.visible_workspaces(db, u)]
+
+
+@app.post("/workspaces")
+def create_workspace(body: WorkspaceIn, u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    try:
+        w = T.create_workspace(db, u, body.name, body.description, body.slug)
+    except T.Forbidden as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"id": w.id, "name": w.name, "slug": w.slug,
+            "credentials_namespace": f"WS_{w.slug.upper()}_* environment variables or [workspaces.{w.slug}] secrets"}
+
+
+@app.get("/workspaces/{workspace_id}/members")
+def get_members(workspace_id: int, u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    try:
+        return T.members(db, u, workspace_id)
+    except T.NotFound:
+        raise HTTPException(404, "workspace not found")
+
+
+@app.put("/workspaces/{workspace_id}/members")
+def put_member(workspace_id: int, body: MemberIn, u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    try:
+        m = T.set_member(db, u, workspace_id, body.email, body.role)
+    except T.NotFound:
+        raise HTTPException(404, "workspace not found")
+    except T.Forbidden as e:
+        raise HTTPException(403, str(e))
+    return {"email": body.email.lower(), "role": m.role}
+
+
+@app.delete("/workspaces/{workspace_id}/members/{email}")
+def delete_member(workspace_id: int, email: str, u: User = Depends(current_user), db=Depends(get_db)):
+    from dsdvc.tenancy import access as T
+    try:
+        return {"removed": T.remove_member(db, u, workspace_id, email)}
+    except T.NotFound:
+        raise HTTPException(404, "workspace not found")
+    except T.Forbidden as e:
+        raise HTTPException(403, str(e))
+
+
+@app.get("/workspace/audit")
+def workspace_audit(limit: int = 200, ctx=Depends(in_workspace("admin")), db=Depends(get_db)):
+    _, ws, _ = ctx
+    rows = db.scalars(select(AuditLog).where(AuditLog.project_id == ws.id).order_by(AuditLog.created_at.desc()).limit(limit)).all()
+    emails = {x.id: x.email for x in db.scalars(select(User).where(User.id.in_({r.user_id for r in rows if r.user_id}))).all()}
+    return json_safe([{"at": r.created_at.isoformat(), "user": emails.get(r.user_id), "action": r.action, "detail": r.detail}
+                      for r in rows])
+
+
+@app.get("/workspace/datasets")
+def workspace_datasets(ctx=Depends(in_workspace("viewer")), db=Depends(get_db)):
+    from dsdvc.onboarding.workspace import list_datasets
+    _, ws, _ = ctx
+    return [{"id": d.id, "filename": d.filename, "rows": d.rows, "status": d.status, "sha256": d.sha256,
+             "created_at": d.created_at.isoformat()} for d in list_datasets(db, ws.id)]
 
 
 # ------------------------------------------------------------------ simulation
@@ -176,12 +340,11 @@ class SimIn(BaseModel):
     paid_daily_budget: dict[str, float] | None = None
     retention_investment: float = 0.2
     population_scale: float = 100.0
-    project_id: int | None = None
 
 
 def _cfg(body: SimIn):
     from dsdvc.diffusion.abm import SimConfig
-    kw = body.model_dump(exclude={"project_id", "stepps", "paid_daily_budget"})
+    kw = body.model_dump(exclude={"stepps", "paid_daily_budget"})
     cfg = SimConfig(**kw)
     if body.stepps:
         cfg.stepps.update(body.stepps)
@@ -194,7 +357,7 @@ def _cfg(body: SimIn):
 @app.post("/simulations")
 def simulate(body: SimIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
     from dsdvc.diffusion.abm import run_simulation
-    key = Cache.key({"sim": body.model_dump(exclude={"project_id"}), "v": SIMULATION_VERSION})
+    key = Cache.key({"sim": body.model_dump(), "v": SIMULATION_VERSION})
     hit = CACHE.get(key)
     if hit:
         METRICS.inc("dsdvc_sim_cache_hits")
@@ -203,7 +366,7 @@ def simulate(body: SimIn, u: User = Depends(require("analyst")), db=Depends(get_
         res = run_simulation(_cfg(body))
     rr = res.run_record
     summary = json_safe(res.summary())
-    db.add(SimulationRunRow(run_id=rr.run_id, project_id=body.project_id, kind="abm", random_seed=rr.random_seed,
+    db.add(SimulationRunRow(run_id=rr.run_id, project_id=None, kind="abm", random_seed=rr.random_seed,
                             network_seed=rr.network_seed, parameters=rr.parameters, data_version=rr.data_version,
                             model_version=rr.model_version, simulation_version=rr.simulation_version,
                             software_version=rr.software_version, result_hash=rr.result_hash, summary=summary,
@@ -219,7 +382,8 @@ def simulate(body: SimIn, u: User = Depends(require("analyst")), db=Depends(get_
 @app.get("/simulations/{run_id}")
 def get_sim(run_id: str, u: User = Depends(require("viewer")), db=Depends(get_db)):
     row = db.scalar(select(SimulationRunRow).where(SimulationRunRow.run_id == run_id))
-    if row is None:
+    creator = db.get(User, row.created_by) if row is not None and row.created_by else None
+    if row is None or creator is None or creator.organization_id != u.organization_id:
         raise HTTPException(404, "run not found")
     return {"run_id": row.run_id, "parameters": row.parameters, "summary": row.summary, "random_seed": row.random_seed,
             "network_seed": row.network_seed, "software_version": row.software_version, "result_hash": row.result_hash,
@@ -238,7 +402,7 @@ def counterfactual(body: CounterfactualIn, u: User = Depends(require("analyst"))
     from dsdvc.experiments.counterfactual import run_counterfactual
     r = run_counterfactual(_cfg(body.simulation), body.scenario, n_reps=body.n_reps)
     table = r["table"].to_dict(orient="records")
-    db.add(ExperimentRow(project_id=body.simulation.project_id, design="counterfactual", question=r["question"],
+    db.add(ExperimentRow(project_id=None, design="counterfactual", question=r["question"],
                          results={"table": table, "interventions": r["interventions"]}))
     db.commit()
     return json_safe({**{k: v for k, v in r.items() if k != "table"}, "table": table, **meta()})
@@ -299,6 +463,8 @@ class CopilotIn(BaseModel):
 def copilot(body: CopilotIn, u: User = Depends(require("viewer"))):
     from dsdvc.content.copilot import ContentCopilot
     pred = VIRALITY_MODELS.get(body.model_id) if body.model_id else None
+    if pred is not None and getattr(pred, "owner_org", None) != u.organization_id:
+        pred = None
     rep = ContentCopilot(pred, brand_constraints={"banned_terms": body.banned_terms}).analyze(
         body.concept, body.caption, body.script, body.transcript, body.brief, body.media_type)
     return json_safe({**rep.__dict__, **meta()})
@@ -326,6 +492,7 @@ def virality_train(body: ContentIn, u: User = Depends(require("analyst"))):
     with METRICS.timer("dsdvc_model_latency", model="virality_train"):
         rep = vp.fit(df, data_version=dv)
     mid = uuid.uuid4().hex[:10]
+    vp.owner_org = u.organization_id
     VIRALITY_MODELS[mid] = vp
     return json_safe({"model_id": mid, "data_version": dv, "definition": rep["viral_definition"], "weights": rep["weights"],
                       "benchmarks": rep["benchmarks"].to_dict(orient="records"), **meta(dv)})
@@ -339,7 +506,7 @@ class PredictIn(BaseModel):
 @app.post("/virality/predict")
 def virality_predict(body: PredictIn, u: User = Depends(require("viewer")), db=Depends(get_db)):
     vp = VIRALITY_MODELS.get(body.model_id)
-    if vp is None:
+    if vp is None or getattr(vp, "owner_org", None) != u.organization_id:
         raise HTTPException(404, "unknown model_id (models are held in memory; retrain after restart)")
     t = time.perf_counter()
     out = vp.predict(pd.DataFrame(body.rows))
@@ -410,10 +577,12 @@ def data_quality(body: DailyIn, u: User = Depends(require("viewer"))):
 
 
 @app.get("/connectors/status")
-def connectors(u: User = Depends(require("viewer"))):
+def connectors(ctx=Depends(in_workspace("viewer"))):
+    from dsdvc.connectors.credentials import settings_for_workspace
     from dsdvc.connectors.credentials import status as conn_status
-    s = get_settings()
-    return {**{f"{k}_connector": v for k, v in conn_status(s).items()},
+    _, ws, _ = ctx
+    s = settings_for_workspace(ws.slug)
+    return {"workspace": ws.slug, **{f"{k}_connector": v for k, v in conn_status(s).items()},
             "instagram_graph_api": bool(s.meta_access_token and s.instagram_business_account_id),
             "facebook_pages_api": bool(s.meta_access_token and s.facebook_page_id),
             "whatsapp_business_platform": bool(s.whatsapp_business_token and s.whatsapp_business_account_id),
@@ -450,7 +619,7 @@ def onboarding_template(key: str, u: User = Depends(require("viewer"))):
 
 @app.post("/onboarding/preview")
 async def onboarding_preview(file: UploadFile = File(...), mapping: str | None = Form(None),
-                             u: User = Depends(require("analyst"))):
+                             ctx=Depends(in_workspace("analyst"))):
     """Suggest (or apply a supplied) column mapping and return the validation scorecard. Stores nothing."""
     import json
     from dsdvc.onboarding.mapping import ColumnMatch, Mapping, apply_mapping, suggest_mapping
@@ -470,7 +639,8 @@ async def onboarding_preview(file: UploadFile = File(...), mapping: str | None =
 
 @app.post("/onboarding/datasets")
 async def onboarding_save(file: UploadFile = File(...), attestation: str = Form(...), mapping: str | None = Form(None),
-                          project_id: int | None = Form(None), u: User = Depends(require("analyst")), db=Depends(get_db)):
+                          ctx=Depends(in_workspace("analyst")), db=Depends(get_db)):
+    u, ws, _ = ctx
     import json
     from dsdvc.onboarding.mapping import ColumnMatch, Mapping, apply_mapping, suggest_mapping
     from dsdvc.onboarding.templates import MARKETING_WEEKLY
@@ -485,7 +655,7 @@ async def onboarding_save(file: UploadFile = File(...), attestation: str = Form(
     sc = validate(canon, MARKETING_WEEKLY)
     try:
         row = save_dataset(db, df=canon, dataset="marketing_weekly", filename=file.filename, mapping=m, scorecard=sc,
-                           attestation=attestation, project_id=project_id, user_id=u.id)
+                           attestation=attestation, project_id=ws.id, user_id=u.id)
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"dataset_id": row.id, "sha256": row.sha256, "rows": row.rows, "status": row.status, "mapping": row.mapping}
@@ -501,15 +671,16 @@ class MMMFitIn(BaseModel):
 
 
 @app.post("/mmm/fit")
-def mmm_fit(body: MMMFitIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+def mmm_fit(body: MMMFitIn, ctx=Depends(in_workspace("analyst")), db=Depends(get_db)):
+    u, ws, _ = ctx
     from dsdvc.database.models import DatasetVersion, MMMRun
     from dsdvc.mmm import analysis as AN
     from dsdvc.mmm.model import LiftTest, MarketingMixModel, MMMSpec
     from dsdvc.onboarding.validate import spend_columns
     from dsdvc.onboarding.workspace import load_dataset
     row = db.get(DatasetVersion, body.dataset_id)
-    if row is None:
-        raise HTTPException(404, "dataset not found")
+    if row is None or row.project_id != ws.id:
+        raise HTTPException(404, "dataset not found in this workspace")
     df = load_dataset(row)
     if body.target not in df:
         raise HTTPException(422, f"dataset has no '{body.target}' column")
@@ -528,7 +699,8 @@ def mmm_fit(body: MMMFitIn, u: User = Depends(require("analyst")), db=Depends(ge
                  model_version=fit.model_version, data_version=fit.data_version, created_by=u.id)
     db.add(run)
     db.commit()
-    MMM_RUNS[run.id] = {"fit": fit, "bt": bt, "summary": summ, "dataset": row}
+    MMM_RUNS[run.id] = {"fit": fit, "bt": bt, "summary": summ, "dataset": row, "workspace_id": ws.id}
+    T_audit(db, u, ws.id, "mmm_fit", run_id=run.id, dataset_id=row.id, verdict=bt.verdict if bt else None)
     return json_safe({"run_id": run.id, "status": "ESTIMATED", "diagnostics": fit.diagnostics,
                       "backtest": {"verdict": bt.verdict, **bt.metrics} if bt else None,
                       "channels": summ.to_dict(orient="records"), **meta(fit.data_version)})
@@ -541,17 +713,18 @@ class PlanIn(BaseModel):
     margin: float = Field(1.0, gt=0, le=1)
 
 
-def _run(run_id: int) -> dict:
-    if run_id not in MMM_RUNS:
+def _run(run_id: int, ws_id: int) -> dict:
+    if run_id not in MMM_RUNS or MMM_RUNS[run_id]["workspace_id"] != ws_id:
         raise HTTPException(404, "run not in memory (fitted models are kept in memory; refit after a restart)")
     return MMM_RUNS[run_id]
 
 
 @app.post("/mmm/{run_id}/plan")
-def mmm_plan(run_id: int, body: PlanIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+def mmm_plan(run_id: int, body: PlanIn, ctx=Depends(in_workspace("analyst")), db=Depends(get_db)):
+    u, ws, _ = ctx
     from dsdvc.database.models import MMMRun
     from dsdvc.mmm import analysis as AN
-    r = _run(run_id)
+    r = _run(run_id, ws.id)
     plan = AN.optimize_budget(r["fit"], body.weekly_budget, max_change=body.max_change, objective=body.objective, margin=body.margin)
     r["plan"] = plan
     out = {"weekly_budget": plan.weekly_budget, "objective": plan.objective, "uplift": plan.uplift, "uplift_low": plan.uplift_low,
@@ -566,11 +739,13 @@ def mmm_plan(run_id: int, body: PlanIn, u: User = Depends(require("analyst")), d
 
 @app.get("/mmm/{run_id}/export/{fmt}")
 def mmm_export(run_id: int, fmt: Literal["xlsx", "pptx"], client: str = "Client", horizon_weeks: int = 13,
-               start: str | None = None, currency: str = "₹", u: User = Depends(require("viewer"))):
+               start: str | None = None, currency: str = "₹", ctx=Depends(in_workspace("viewer")), db=Depends(get_db)):
+    u, ws, _ = ctx
     import datetime as dt
     from fastapi.responses import Response
     from dsdvc.mmm import analysis as AN
-    r = _run(run_id)
+    r = _run(run_id, ws.id)
+    T_audit(db, u, ws.id, "export_downloaded", run_id=run_id, format=fmt)
     if "plan" not in r:
         raise HTTPException(409, "create a plan first: POST /mmm/{run_id}/plan")
     fit, ds = r["fit"], r["dataset"]
@@ -603,11 +778,11 @@ class PullIn(BaseModel):
     demo: bool = False
     save: bool = False
     attestation: str | None = None
-    project_id: int | None = None
 
 
 @app.post("/connectors/pull")
-def connectors_pull(body: PullIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+def connectors_pull(body: PullIn, ctx=Depends(in_workspace("analyst")), db=Depends(get_db)):
+    u, ws, _ = ctx
     """Pull Meta Ads / GA4 / Shopify for a date range and assemble the weekly MMM dataset.
     ``demo=true`` uses the labelled SYNTHETIC API simulators. ``save=true`` stores it as a dataset version."""
     import datetime as dt
@@ -621,11 +796,13 @@ def connectors_pull(body: PullIn, u: User = Depends(require("analyst")), db=Depe
     if start >= end:
         raise HTTPException(422, "start must be before end")
     with METRICS.timer("dsdvc_connector_latency", source="+".join(body.sources)):
-        res, errors = pull_weekly(C.connectors(demo=body.demo), start, end, list(body.sources), meta_mode=body.meta_mode,
+        res, errors = pull_weekly(C.connectors(C.settings_for_workspace(ws.slug), demo=body.demo), start, end, list(body.sources), meta_mode=body.meta_mode,
                                   rules=ChannelRules(campaign_contains=list(body.campaign_rules), split_platforms=body.split_platforms),
                                   outcome_source=body.outcome_source)
     for k in errors:
         METRICS.inc("dsdvc_ingestion_failures", source=k)
+    T_audit(db, u, ws.id, "connector_pull", sources=list(body.sources), start=body.start, end=body.end, demo=body.demo,
+            errors=sorted(errors))
     if res is None:
         return json_safe({"status": "DATA_UNAVAILABLE", "errors": errors})
     sc = validate(res.data, MARKETING_WEEKLY)
@@ -640,7 +817,7 @@ def connectors_pull(body: PullIn, u: User = Depends(require("analyst")), db=Depe
             row = save_dataset(db, df=res.data, dataset="marketing_weekly",
                                filename=f"api_pull_{'_'.join(body.sources)}_{start}_{end}",
                                mapping=suggest_mapping(res.data, MARKETING_WEEKLY), scorecard=sc, attestation=att,
-                               project_id=body.project_id, user_id=u.id)
+                               project_id=ws.id, user_id=u.id)
             out["dataset_id"] = row.id
         except ValueError as e:
             raise HTTPException(422, str(e))
@@ -654,10 +831,9 @@ class ResearchIn(BaseModel):
     budget: float = 600_000.0
     n_agents: int = Field(1000, ge=200, le=5000)
     reps: int = Field(3, ge=2, le=20)
-    project_id: int | None = None
 
 
-def _run_research(job_id: str, body: ResearchIn):
+def _run_research(job_id: str, body: ResearchIn, workspace_id: int):
     from dsdvc.research_agent.agent import MarketingResearchAgent, ResearchInputs
     from dsdvc.research_agent.report import render_markdown
     try:
@@ -666,7 +842,7 @@ def _run_research(job_id: str, body: ResearchIn):
                                         reps=body.reps).run(body.request, ResearchInputs(budget=body.budget))
         md = render_markdown(mem, S)
         with SessionLocal() as db:
-            db.add(ResearchProjectMemory(project_id=body.project_id, memory_id=mem.project_id,
+            db.add(ResearchProjectMemory(project_id=workspace_id, memory_id=mem.project_id,
                                          memory=json_safe(mem.model_dump(mode="json")), report_markdown=md))
             db.commit()
         JOBS[job_id].update(json_safe(dict(status="done", memory_id=mem.project_id, report_markdown=md,
@@ -677,15 +853,17 @@ def _run_research(job_id: str, body: ResearchIn):
 
 
 @app.post("/research")
-def research(body: ResearchIn, u: User = Depends(require("analyst"))):
+def research(body: ResearchIn, ctx=Depends(in_workspace("analyst"))):
+    u, ws, _ = ctx
     job = uuid.uuid4().hex[:12]
-    JOBS[job] = {"status": "queued", "created_at": _now(), "user": u.id}
-    threading.Thread(target=_run_research, args=(job, body), daemon=True).start()
+    JOBS[job] = {"status": "queued", "created_at": _now(), "user": u.id, "workspace_id": ws.id}
+    threading.Thread(target=_run_research, args=(job, body, ws.id), daemon=True).start()
     return {"job_id": job, "status": "queued"}
 
 
 @app.get("/research/{job_id}")
-def research_status(job_id: str, u: User = Depends(require("viewer"))):
-    if job_id not in JOBS:
+def research_status(job_id: str, ctx=Depends(in_workspace("viewer"))):
+    _, ws, _ = ctx
+    if job_id not in JOBS or JOBS[job_id].get("workspace_id") != ws.id:
         raise HTTPException(404, "unknown job")
     return JOBS[job_id]

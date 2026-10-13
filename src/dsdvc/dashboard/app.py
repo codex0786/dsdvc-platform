@@ -233,6 +233,9 @@ UPLOAD_KEYS: dict[str, str] = {}
 
 
 def read_upload(label: str, key: str) -> pd.DataFrame | None:
+    ctx = st.session_state.get("ctx")
+    if ctx is not None and (ctx.public_demo or not ctx.can("analyst")):
+        return None  # no client data in the public demo / for viewers
     f = st.sidebar.file_uploader(label, type=["csv"], key=key)
     if f is None:
         UPLOAD_KEYS.pop(key, None)
@@ -254,6 +257,9 @@ def main():
 
     sb = st.sidebar
     sb.header("Data")
+    ctx = st.session_state.get("ctx")
+    if ctx is not None and ctx.public_demo:
+        sb.caption("Uploads are disabled in the public demo; use the labelled synthetic data.")
     synthetic = sb.toggle("Use labelled SYNTHETIC demo data where observed data is missing", value=False,
                           help="Off = authorised-data-only mode. Synthetic data is always badged SYNTHETIC.")
     content_up = read_upload("Content export (CSV)", "content")

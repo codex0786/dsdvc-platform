@@ -31,6 +31,13 @@ python scripts/demo_research.py --synthetic   # end-to-end research report (labe
 The API needs a first admin key. Generate one with `make admin-key` and set it as
 `DSDVC_BOOTSTRAP_ADMIN_KEY` in `.env` before the first start (see [docs/API.md](docs/API.md)).
 
+## Client workspaces & sign-in
+
+Each client gets its own **workspace**: data, model runs, exports, connector credentials and audit log are
+separated server-side, and people get access per workspace (viewer / analyst / admin). Users sign in with
+**Google, Microsoft Entra ID or Okta** (OIDC) on both the dashboard and the API. Without sign-in configured, the
+app runs as a **public demo** with synthetic data only. See [docs/SECURITY_AND_TENANCY.md](docs/SECURITY_AND_TENANCY.md).
+
 ## Client workflow (start here)
 
 The dashboard opens on **Client workflow**, the guided path for a paying engagement:
@@ -78,11 +85,12 @@ Details: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 | Connectors | `dsdvc.connectors` | Meta Marketing API (official MMM export), GA4 Data API, Shopify Admin GraphQL (bulk orders); weekly assembly with time zones, channel rules, GA4↔Shopify reconciliation; SYNTHETIC API simulators for demo/tests |
 | Onboarding & exports | `dsdvc.onboarding`, `dsdvc.exports` | Data templates, automatic column mapping, validation scorecard, versioned datasets with attestation; Excel media plan and PowerPoint deck |
 | Agent | `dsdvc.research_agent` | 14-step `MarketingResearchAgent`, 12 tools, traceable `ResearchMemory`, 24-section report, optional Claude narrator with a numeric anti-fabrication guard |
+| Tenancy & SSO | `dsdvc.tenancy` | Client workspaces, per-workspace roles, OIDC (PKCE, JWKS-verified ID tokens), session tokens, identity-binding rules, audit; Alembic migrations |
 | Serving | `dsdvc.api`, `dsdvc.dashboard`, `dsdvc.database` | FastAPI (roles: admin/analyst/viewer), Streamlit (22 tabs), SQLAlchemy (PostgreSQL/SQLite), Prometheus metrics, Redis cache, MLflow logging |
 
 ## Documentation
 
-[MMM method](docs/MMM.md) · [Connectors](docs/CONNECTORS.md) · [Client onboarding](docs/CLIENT_ONBOARDING.md) · [Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
+[Workspaces & SSO](docs/SECURITY_AND_TENANCY.md) · [MMM method](docs/MMM.md) · [Connectors](docs/CONNECTORS.md) · [Client onboarding](docs/CLIENT_ONBOARDING.md) · [Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
 [API](docs/API.md) · [Calibration](docs/CALIBRATION.md) · [Validation](docs/VALIDATION.md) ·
 [Literature](docs/LITERATURE.md) ([per-paper summaries](docs/literature/)) · [Deployment](docs/DEPLOYMENT.md) · [Ethics](docs/ETHICS.md)
 

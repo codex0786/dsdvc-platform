@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dsdvc.dashboard.app import BADGE, SERIES, badge, style
+from dsdvc.dashboard.auth import current
 from dsdvc.onboarding.mapping import IGNORE, Mapping, apply_mapping, suggest_mapping
 from dsdvc.onboarding.templates import CHANNEL_ALIASES, LIFT_TESTS, MARKETING_WEEKLY, template_frame
 from dsdvc.onboarding.validate import spend_columns, validate
@@ -23,7 +24,9 @@ CHECK_ICON = {"pass": "✅", "warn": "⚠️", "fail": "⛔"}
 
 
 def _state() -> dict:
-    return st.session_state.setdefault("wf", {})
+    """Workflow state is kept per client workspace, so switching workspace never carries data across."""
+    from dsdvc.dashboard.auth import current
+    return st.session_state.setdefault(f"wf_ws_{current().ws_id}", {})
 
 
 def _read_any(f) -> pd.DataFrame:
@@ -40,7 +43,7 @@ def _read_any(f) -> pd.DataFrame:
 
 
 @st.cache_resource(show_spinner=False)
-def _fit(sha: str, target: str, channels: tuple, controls: tuple, holdout: int, lift_key: str, _df: pd.DataFrame, _lifts):
+def _fit(ws_id: int, sha: str, target: str, channels: tuple, controls: tuple, holdout: int, lift_key: str, _df: pd.DataFrame, _lifts):
     from dsdvc.mmm import analysis as A
     from dsdvc.mmm.model import MarketingMixModel, MMMSpec
     spec = MMMSpec(target_col=target, channels=list(channels), controls=list(controls))
@@ -68,6 +71,28 @@ def _default_range(demo: bool) -> tuple[dt.date, dt.date]:
     return last_sunday - dt.timedelta(weeks=104) + dt.timedelta(days=1), last_sunday
 
 
+def _reopen_panel(W: dict):
+    """Datasets already accepted in this workspace (persisted, so work continues across sessions)."""
+    from dsdvc.database.models import SessionLocal
+    from dsdvc.onboarding.workspace import list_datasets, load_dataset
+    with SessionLocal() as db:
+        rows = list_datasets(db, current().ws_id)
+        if not rows:
+            return
+        opts = {r.id: f"{r.filename} · {r.rows} weeks · {r.status} · {r.created_at:%d %b %Y %H:%M}" for r in rows}
+        with st.expander(f"Re-open an accepted dataset in this workspace ({len(rows)})"):
+            pick = st.selectbox("Dataset", list(opts), format_func=opts.get, key="reopen_pick")
+            if st.button("Open dataset"):
+                r = next(x for x in rows if x.id == pick)
+                W["accepted"] = {"df": load_dataset(r), "sha": r.sha256, "rows": r.rows, "status": r.status, "id": r.id,
+                                 "filename": r.filename, "synthetic": "SYNTHETIC" in (r.attestation or "") or
+                                 r.filename == "sample_client_export.csv"}
+                W["attestation"] = r.attestation
+                for k in ("fit_key", "plan", "fit"):
+                    W.pop(k, None)
+                st.success(f"Opened {r.filename}. Continue at step 3 · Model.")
+
+
 def _upload_panel(W: dict):
     c1, c2 = st.columns([2, 1])
     with c2:
@@ -79,7 +104,14 @@ def _upload_panel(W: dict):
             W["raw"], W["raw_name"], W["raw_synthetic"] = messy_client_export(), "sample_client_export.csv", True
             W.pop("accepted", None)
     with c1:
-        f = st.file_uploader("Upload the client's weekly export (CSV or Excel)", type=["csv", "xlsx", "xls"], key="wf_upload")
+        if current().public_demo:
+            st.info("Uploading client data requires sign-in. In the public demo, load the SYNTHETIC sample instead.")
+            f = None
+        elif not current().can("analyst"):
+            st.info("Viewers can't upload data in this workspace.")
+            f = None
+        else:
+            f = st.file_uploader("Upload the client's weekly export (CSV or Excel)", type=["csv", "xlsx", "xls"], key="wf_upload")
         if f is not None and f.name != W.get("raw_name"):
             W["raw"], W["raw_name"], W["raw_synthetic"] = _read_any(f), f.name, False
             W.pop("accepted", None)
@@ -89,11 +121,13 @@ def _pull_panel(W: dict):
     from dsdvc.connectors import credentials as C
     from dsdvc.connectors.meta_ads import ChannelRules
     from dsdvc.connectors.pull import pull_weekly
-    stat = C.status()
+    ctx = current()
+    ws_settings = C.settings_for_workspace(ctx.ws_slug)
+    stat = C.status(ws_settings) if not ctx.public_demo else {"meta": False, "ga4": False, "shopify": False}
     cols = st.columns(4)
     for col, (k, label) in zip(cols, (("meta", "Meta Ads"), ("ga4", "Google Analytics 4"), ("shopify", "Shopify"))):
         col.markdown(f"**{label}**<br>{'🟢 connected' if stat[k] else '⚪ not configured'}", unsafe_allow_html=True)
-    demo = cols[3].toggle("Demo accounts (SYNTHETIC)", value=not any(stat.values()),
+    demo = cols[3].toggle("Demo accounts (SYNTHETIC)", value=not any(stat.values()), disabled=ctx.public_demo,
                           help="Simulated Meta/GA4/Shopify APIs with planted effects - exercises the real connector code.")
     if not demo and not any(stat.values()):
         st.info("No accounts connected. Add credentials as environment variables or Streamlit secrets "
@@ -119,7 +153,9 @@ def _pull_panel(W: dict):
                            help="auto = Shopify net sales when available, else GA4 revenue.")
     extra = st.file_uploader("Other channel spend not covered by the APIs (CSV: date, spend; one file per channel)",
                              type=["csv"], accept_multiple_files=True, key="pull_extra")
-    if st.button("Pull data", type="primary", disabled=not sources or start >= end):
+    if ctx.public_demo:
+        demo = True
+    if st.button("Pull data", type="primary", disabled=not sources or start >= end or not ctx.can("analyst")):
         rules = ChannelRules(campaign_contains=[(r[0], r[1]) for r in rules_df.dropna().itertuples(index=False) if r[0] and r[1]],
                              split_platforms=split)
         extra_spend = {}
@@ -127,11 +163,13 @@ def _pull_panel(W: dict):
             name = f.name.rsplit(".", 1)[0].lower().replace(" ", "_").removeprefix("spend_")
             extra_spend[name] = pd.read_csv(f)
         with st.status("Pulling data…", expanded=True) as box:
-            res, errors = pull_weekly(C.connectors(demo=demo), start, end, sources, meta_mode=meta_mode, rules=rules,
+            res, errors = pull_weekly(C.connectors(ws_settings, demo=demo), start, end, sources, meta_mode=meta_mode, rules=rules,
                                       outcome_source=outcome, extra_spend=extra_spend or None, progress=box.write)
             box.update(label="Pull finished" if res is not None else "Nothing could be pulled",
                        state="complete" if res is not None else "error")
         W["pull_errors"] = errors
+        from dsdvc.dashboard.auth import audit
+        audit("connector_pull", sources=sources, start=str(start), end=str(end), demo=demo, errors=sorted(errors))
         if res is not None:
             W["pull_result"] = res
             W["raw"], W["raw_name"], W["raw_synthetic"] = res.data, f"api_pull_{'_'.join(sources)}_{start}_{end}", demo
@@ -157,8 +195,12 @@ def _pull_panel(W: dict):
 
 
 def workflow_page():
+    ctx = current()
     st.title("Client workflow")
-    st.caption("Brief → Data → Model → Plan → Export. Each step must pass before the next one unlocks.")
+    if ctx.ws_id is None:
+        st.info("Create a client workspace on the Administration page first.")
+        return
+    st.caption(f"**{ctx.ws_name}** · Brief → Data → Model → Plan → Export. Each step must pass before the next one unlocks.")
     W = _state()
     tabs = st.tabs(["1 · Brief", "2 · Data", "3 · Model", "4 · Plan", "5 · Export"])
 
@@ -182,6 +224,7 @@ def workflow_page():
         st.subheader("Weekly marketing & sales data")
         mode = st.radio("Data source", ["Upload a file", "Pull from connected accounts"], horizontal=True,
                         key="wf_source_mode")
+        _reopen_panel(W)
         if mode == "Pull from connected accounts":
             _pull_panel(W)
         else:
@@ -217,13 +260,14 @@ def workflow_page():
             att = st.text_input("Authorisation", W.get("attestation") or W.get("pull_attestation", ""),
                                 placeholder="e.g. 'Provided by client marketing team under MSA dated …; contains no personal data'",
                                 help="Required. Recorded with the dataset and printed in every export.")
-            if st.button("Accept dataset", type="primary", disabled=sc.status == "BLOCKED" or not att.strip()):
+            if st.button("Accept dataset", type="primary",
+                         disabled=sc.status == "BLOCKED" or not att.strip() or not current().can("analyst")):
                 from dsdvc.database.models import SessionLocal, init_db
                 from dsdvc.onboarding.workspace import save_dataset
                 init_db()
                 with SessionLocal() as db:
                     row = save_dataset(db, df=canon, dataset="marketing_weekly", filename=W["raw_name"], mapping=mapping,
-                                       scorecard=sc, attestation=att)
+                                       scorecard=sc, attestation=att, project_id=current().ws_id, user_id=current().user_id)
                     W["accepted"] = {"df": canon, "sha": row.sha256, "rows": len(canon), "status": sc.status, "id": row.id,
                                      "filename": W["raw_name"], "synthetic": W.get("raw_synthetic", False)}
                 W["attestation"] = att
@@ -235,7 +279,8 @@ def workflow_page():
                 st.success(f"Accepted · {W['accepted']['rows']} weeks · SHA-256 {W['accepted']['sha'][:16]}…")
         with st.expander("Optional: lift-test results (calibrates the model with experiments)"):
             st.dataframe(LIFT_TESTS.dictionary(), width="stretch", hide_index=True)
-            lf = st.file_uploader("Lift tests CSV (channel, start, end, lift, se)", type=["csv"], key="wf_lifts")
+            lf = None if (current().public_demo or not current().can("analyst")) else \
+                st.file_uploader("Lift tests CSV (channel, start, end, lift, se)", type=["csv"], key="wf_lifts")
             if lf is not None:
                 lt = pd.read_csv(lf)
                 missing = [c for c in ("channel", "start", "end", "lift", "se") if c not in lt]
@@ -264,14 +309,14 @@ def workflow_page():
                 from dsdvc.mmm.model import LiftTest
                 lifts = [LiftTest(f"spend_{r.channel}" if not str(r.channel).startswith("spend_") else r.channel,
                                   pd.Timestamp(r.start), pd.Timestamp(r.end), float(r.lift), float(r.se)) for r in W["lifts"].itertuples()]
-            if st.button("Fit model and back-test", type="primary", disabled=not channels):
+            if st.button("Fit model and back-test", type="primary", disabled=not channels or not current().can("analyst")):
                 W["fit_key"] = (W["accepted"]["sha"], target, tuple(channels), tuple(controls), holdout,
                                 str([(l.channel, l.start, l.end, l.lift, l.se) for l in lifts]))
                 W.pop("plan", None)
             if "fit_key" in W:
                 with st.spinner("Fitting the marketing mix model (incl. back-test)…"):
-                    fit, bt = _fit(*W["fit_key"], df, lifts)
-                summ, params, curves, dec = _summaries(str(W["fit_key"]), fit)
+                    fit, bt = _fit(current().ws_id, *W["fit_key"], df, lifts)
+                summ, params, curves, dec = _summaries(f"{current().ws_id}:{W['fit_key']}", fit)
                 W["fit"], W["bt"], W["summ"], W["params"], W["curves"], W["dec"] = fit, bt, summ, params, curves, dec
                 cur = W["currency"]
                 if bt:
@@ -337,14 +382,14 @@ def workflow_page():
         else:
             from dsdvc.mmm import analysis as A
             fit, cur = W["fit"], W["currency"]
-            current = float(sum(fit.data[c].mean() for c in fit.spec.channels))
+            current_weekly_total = float(sum(fit.data[c].mean() for c in fit.spec.channels))
             c1, c2, c3 = st.columns(3)
-            budget = c1.number_input("Weekly budget", 0.0, current * 10, float(W.get("budget", current)), max(current * 0.01, 1.0))
+            budget = c1.number_input("Weekly budget", 0.0, current_weekly_total * 10, float(W.get("budget", current_weekly_total)), max(current_weekly_total * 0.01, 1.0))
             objective = c2.radio("Objective", ["outcome", "profit"], horizontal=True,
                                  help="outcome: spend the full budget for maximum incremental outcome. profit: margin × outcome − spend; may under-spend.")
             max_change = c3.slider("Max change per channel vs today", 0.1, 1.0, 0.5, 0.05,
                                    help="Larger moves leave the spend range the model has evidence for.")
-            if st.button("Optimise plan", type="primary"):
+            if st.button("Optimise plan", type="primary", disabled=not current().can("analyst")):
                 W["budget"] = budget
                 W["plan"] = A.optimize_budget(fit, budget, max_change=max_change, objective=objective, margin=W["margin"])
             if "plan" in W:
@@ -402,17 +447,22 @@ def workflow_page():
                                   outcome_label=target, currency=W["currency"])
             slug = "".join(ch if ch.isalnum() else "_" for ch in W["client"]).strip("_").lower()
             c1, c2, c3 = st.columns(3)
+            from dsdvc.dashboard.auth import audit
             c1.download_button("⬇ Media plan (Excel)", xlsx, f"{slug}_media_plan.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary",
+                               on_click=audit, args=("export_downloaded",), kwargs={"format": "xlsx", "dataset_id": acc["id"]})
             c2.download_button("⬇ Executive deck (PowerPoint)", pptx, f"{slug}_mmm_deck.pptx",
-                               "application/vnd.openxmlformats-officedocument.presentationml.presentation", type="primary")
-            c3.download_button("⬇ Canonical data (CSV)", acc["df"].to_csv(index=False), f"{slug}_canonical_data.csv")
+                               "application/vnd.openxmlformats-officedocument.presentationml.presentation", type="primary",
+                               on_click=audit, args=("export_downloaded",), kwargs={"format": "pptx", "dataset_id": acc["id"]})
+            c3.download_button("⬇ Canonical data (CSV)", acc["df"].to_csv(index=False), f"{slug}_canonical_data.csv",
+                               on_click=audit, args=("export_downloaded",), kwargs={"format": "csv", "dataset_id": acc["id"]})
             if st.button("Record this run in the project log"):
                 from dsdvc.core.reproducibility import json_safe
                 from dsdvc.database.models import MMMRun, SessionLocal
                 f = W["fit"]
                 with SessionLocal() as db:
-                    db.add(MMMRun(dataset_version_id=acc["id"], spec=json_safe(f.spec.__dict__), diagnostics=json_safe(f.diagnostics),
+                    db.add(MMMRun(project_id=current().ws_id, created_by=current().user_id, dataset_version_id=acc["id"],
+                                  spec=json_safe(f.spec.__dict__), diagnostics=json_safe(f.diagnostics),
                                   channel_summary=json_safe(W["summ"].to_dict(orient="records")),
                                   backtest=json_safe({"verdict": W["bt"].verdict, **W["bt"].metrics}) if W["bt"] else None,
                                   plan=json_safe({"table": W["plan"].table.to_dict(orient="records"), "uplift": W["plan"].uplift,

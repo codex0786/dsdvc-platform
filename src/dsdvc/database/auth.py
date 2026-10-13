@@ -14,7 +14,7 @@ from sqlalchemy import select
 from dsdvc.database.models import ApiKey, AuditLog, Organization, Project, User
 
 ROLES = ("viewer", "analyst", "admin")
-ROLE_RANK = {r: i for i, r in enumerate(ROLES)}
+ROLE_RANK = {r: i for i, r in enumerate(ROLES)} | {"member": 0}  # member = workspace access via memberships only
 ITERATIONS = 200_000
 
 
@@ -36,8 +36,8 @@ def create_org(db, name: str) -> Organization:
 
 
 def create_user(db, email: str, org: Organization, role: str = "viewer") -> User:
-    if role not in ROLES:
-        raise ValueError(f"role must be one of {ROLES}")
+    if role not in ROLE_RANK:
+        raise ValueError(f"role must be one of {tuple(ROLE_RANK)}")
     u = User(email=email, organization_id=org.id, role=role)
     db.add(u)
     db.commit()

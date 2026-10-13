@@ -159,6 +159,8 @@ def test_api_pull_demo_and_save():
     from dsdvc.api.main import app
     H = {"X-API-Key": os.environ["DSDVC_BOOTSTRAP_ADMIN_KEY"]}
     with TestClient(app) as c:
+        ws = c.post("/workspaces", headers=H, json={"name": "Connector Pull WS"}).json()
+        H = {**H, "X-Workspace-Id": str(ws["id"])}
         st = c.get("/connectors/status", headers=H).json()
         assert st["meta_connector"] is False and st["shopify_connector"] is False
         r = c.post("/connectors/pull", headers=H, json={"start": "2024-01-01", "end": "2024-12-29", "demo": True,

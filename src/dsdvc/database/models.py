@@ -18,9 +18,13 @@ class Base(DeclarativeBase):
 
 
 class Organization(Base):
+    """The agency (tenant root). Client workspaces belong to it."""
     __tablename__ = "organizations"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True)
+    # SSO just-in-time provisioning: verified emails on these domains may create an account
+    # (with no workspace access until an admin grants it). Empty = invitation only.
+    allowed_email_domains: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -29,20 +33,45 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True)
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"))
-    role: Mapped[str] = mapped_column(String(20), default="viewer")   # admin / analyst / viewer
+    # organisation-level role: "admin" administers every workspace of the organisation; any other
+    # value ("member", or legacy "analyst"/"viewer" for API service users) needs workspace memberships.
+    role: Mapped[str] = mapped_column(String(20), default="member")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    auth_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    auth_subject: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sessions_valid_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     organization = relationship("Organization")
 
 
 class Project(Base):
+    """A client workspace. Every client-data row (datasets, model runs, observations, credentials,
+    audit entries) carries ``project_id``; access is granted per workspace through ``Membership``."""
     __tablename__ = "projects"
     id: Mapped[int] = mapped_column(primary_key=True)
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"))
     name: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)  # namespaces credentials
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (UniqueConstraint("organization_id", "name"),)
+
+
+Workspace = Project  # domain name used throughout the tenancy layer
+
+
+class Membership(Base):
+    __tablename__ = "memberships"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20))  # admin / analyst / viewer
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (UniqueConstraint("user_id", "project_id"),)
 
 
 class ApiKey(Base):
@@ -178,6 +207,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(100))
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -203,6 +233,8 @@ def SessionLocal():
 
 
 def init_db(url: str | None = None):
+    """Bring the schema to the latest migration (fresh, migrated, or pre-migration databases)."""
     eng = get_engine(url)
-    Base.metadata.create_all(eng)
+    from dsdvc.database.migrate import upgrade
+    upgrade(eng)
     return eng

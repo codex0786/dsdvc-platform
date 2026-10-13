@@ -8,6 +8,19 @@ Interactive docs: `http://localhost:8000/docs` (OpenAPI).
   it is used only when the user table is empty.
 * Roles: **viewer** (read, analyse text) < **analyst** (run models/simulations) < **admin** (orgs, users, projects, keys).
 
+## Workspaces
+Client-data endpoints require **`X-Workspace-Id`** (a workspace you belong to). Sign in with SSO via
+`GET /auth/oidc/{provider}/login` (bearer session token), or use an API key. See [SECURITY_AND_TENANCY.md](SECURITY_AND_TENANCY.md).
+
+| Method & path | Who | Purpose |
+|---|---|---|
+| `GET /auth/providers` · `GET /auth/oidc/{p}/login` · `GET /auth/oidc/{p}/callback` · `POST /auth/logout` | anyone / signed-in | OIDC sign-in, session tokens, revoke all sessions |
+| `GET /me` · `GET /workspaces` | signed-in | identity and accessible workspaces |
+| `POST /workspaces` | org admin | create a client workspace |
+| `GET/PUT /workspaces/{id}/members` · `DELETE /workspaces/{id}/members/{email}` | workspace admin | manage access |
+| `PUT /admin/organization/sso` · `POST /admin/users` · `DELETE /admin/api-keys/{prefix}` | org admin | sign-in domains, service accounts, key revocation (own organisation only) |
+| `GET /workspace/datasets` · `GET /workspace/audit` | viewer / admin | workspace datasets and audit log |
+
 ## Endpoints
 | Method & path | Role | Purpose |
 |---|---|---|

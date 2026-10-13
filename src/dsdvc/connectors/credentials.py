@@ -1,4 +1,10 @@
-"""Resolve connector credentials from environment variables or Streamlit secrets (never from the database)."""
+"""Resolve connector credentials from environment variables or Streamlit secrets (never from the database).
+
+Multi-client rule: credentials are namespaced per workspace and never shared across clients.
+  * environment:   WS_<SLUG>_META_ACCESS_TOKEN, WS_<SLUG>_SHOPIFY_SHOP, …
+  * Streamlit:     [workspaces.<slug>] META_ACCESS_TOKEN = "…"
+Un-namespaced (global) credentials are used only in single-tenant mode (DSDVC_SINGLE_TENANT=true).
+"""
 from __future__ import annotations
 
 import os
@@ -72,3 +78,43 @@ def connectors(s: Settings | None = None, demo: bool = False, seed: int = 0) -> 
                                 service_account_info=s.ga4_service_account_json),
             "shopify": ShopifyConnector(s.shopify_shop, s.shopify_access_token, s.shopify_api_version,
                                         client_id=s.shopify_client_id, client_secret=s.shopify_client_secret)}
+
+
+CONNECTOR_KEYS = ("META_ACCESS_TOKEN", "META_AD_ACCOUNT_ID", "META_GRAPH_API_VERSION", "GA4_PROPERTY_ID", "GA4_ACCESS_TOKEN",
+                  "GOOGLE_APPLICATION_CREDENTIALS", "GA4_SERVICE_ACCOUNT_JSON", "SHOPIFY_SHOP", "SHOPIFY_ACCESS_TOKEN",
+                  "SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET", "SHOPIFY_API_VERSION")
+FIELD = {"META_ACCESS_TOKEN": "meta_access_token", "META_AD_ACCOUNT_ID": "meta_ad_account_id",
+         "META_GRAPH_API_VERSION": "graph_api_version", "GA4_PROPERTY_ID": "ga4_property_id",
+         "GA4_ACCESS_TOKEN": "ga4_access_token", "GOOGLE_APPLICATION_CREDENTIALS": "google_application_credentials",
+         "GA4_SERVICE_ACCOUNT_JSON": "ga4_service_account_json", "SHOPIFY_SHOP": "shopify_shop",
+         "SHOPIFY_ACCESS_TOKEN": "shopify_access_token", "SHOPIFY_CLIENT_ID": "shopify_client_id",
+         "SHOPIFY_CLIENT_SECRET": "shopify_client_secret", "SHOPIFY_API_VERSION": "shopify_api_version"}
+
+
+def single_tenant() -> bool:
+    return (lookup("DSDVC_SINGLE_TENANT") or "").lower() == "true"
+
+
+def _workspace_secret(slug: str, key: str) -> str | None:
+    v = os.environ.get(f"WS_{slug.upper()}_{key}")
+    if v:
+        return v
+    try:
+        import streamlit as st
+        return (st.secrets.get("workspaces", {}) or {}).get(slug, {}).get(key)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def settings_for_workspace(slug: str | None) -> Settings:
+    """Connector settings for one client workspace. Global credentials are *not* inherited unless the
+    deployment is single-tenant, so client A's tokens can never be used for client B."""
+    from dsdvc.config.settings import get_settings
+    base = settings_with_secrets() if single_tenant() else get_settings().model_copy(
+        update={v: None for k, v in FIELD.items() if not k.endswith("_VERSION")})
+    if slug:
+        for key in CONNECTOR_KEYS:
+            val = _workspace_secret(slug, key)
+            if val:
+                setattr(base, FIELD[key], val)
+    return base

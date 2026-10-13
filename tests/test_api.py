@@ -31,7 +31,7 @@ def test_auth_and_roles(client):
     analyst = client.post("/admin/users", headers=H(ADMIN), json={"email": "a@x.io", "organization": "acme", "role": "analyst"}).json()
     assert viewer["api_key"].startswith("dsdvc_")
     assert client.post("/simulations", headers=H(viewer["api_key"]), json={"n_agents": 200, "steps": 10}).status_code == 403
-    assert client.post("/admin/organizations", headers=H(analyst["api_key"]), json={"name": "x"}).status_code == 403
+    assert client.post("/workspaces", headers=H(analyst["api_key"]), json={"name": "x"}).status_code == 403  # org admins only
     r = client.post("/simulations", headers=H(analyst["api_key"]), json={"n_agents": 200, "steps": 15})
     assert r.status_code == 200
     body = r.json()
@@ -56,7 +56,9 @@ def test_model_endpoints(client):
     i = client.post("/attribution/incrementality", headers=h, json={"treat_conv": 50, "treat_n": 1000, "ctrl_conv": 40, "ctrl_n": 1000}).json()
     assert i["incremental_conversions"] == pytest.approx(10)
     assert client.post("/virality/train", headers=h, json={}).status_code == 422  # no data, no fabrication
-    c = client.get("/connectors/status", headers=h).json()
-    assert c["instagram_graph_api"] is False
+    assert client.get("/connectors/status", headers=h).status_code == 404  # client data needs a workspace
+    ws = client.post("/workspaces", headers=h, json={"name": "Model Endpoints WS"}).json()
+    c = client.get("/connectors/status", headers={**h, "X-Workspace-Id": str(ws["id"])}).json()
+    assert c["instagram_graph_api"] is False and c["meta_connector"] is False
     cp = client.post("/copilot", headers=h, json={"caption": "Guaranteed miracle cure"}).json()
     assert cp["risks"] and cp["model_version"]

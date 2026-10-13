@@ -130,14 +130,28 @@ def test_workspace_requires_attestation(tmp_path, monkeypatch):
     from dsdvc.onboarding.workspace import load_dataset, save_dataset
     monkeypatch.setenv("DSDVC_DATA_DIR", str(tmp_path))
     init_db()
+    from dsdvc.database.models import Organization, Project
+    with SessionLocal() as db:
+        org = db.query(Organization).first() or Organization(name="t")
+        db.add(org)
+        db.flush()
+        ws = Project(organization_id=org.id, name=f"attest-{tmp_path.name}", slug=f"attest_{tmp_path.name}"[:60], archived=False)
+        db.add(ws)
+        db.commit()
+        ws_id = ws.id
     raw = messy_client_export()
     m = suggest_mapping(raw, MARKETING_WEEKLY)
     canon, _ = apply_mapping(raw, m, MARKETING_WEEKLY)
     sc = validate(canon, MARKETING_WEEKLY)
     with SessionLocal() as db:
         with pytest.raises(ValueError):
-            save_dataset(db, df=canon, dataset="marketing_weekly", filename="x.csv", mapping=m, scorecard=sc, attestation=" ")
-        row = save_dataset(db, df=canon, dataset="marketing_weekly", filename="x.csv", mapping=m, scorecard=sc, attestation="test")
+            save_dataset(db, df=canon, dataset="marketing_weekly", filename="x.csv", mapping=m, scorecard=sc, attestation=" ",
+                         project_id=ws_id)
+        with pytest.raises(ValueError):
+            save_dataset(db, df=canon, dataset="marketing_weekly", filename="x.csv", mapping=m, scorecard=sc, attestation="ok",
+                         project_id=None)
+        row = save_dataset(db, df=canon, dataset="marketing_weekly", filename="x.csv", mapping=m, scorecard=sc, attestation="test",
+                           project_id=ws_id)
         back = load_dataset(row)
     assert len(back) == 156 and row.sha256 and row.status == "READY"
 
@@ -173,6 +187,8 @@ def test_api_onboarding_to_export():
     csv = messy_client_export().to_csv(index=False).encode()
     with TestClient(app) as c:
         assert c.get("/onboarding/templates/marketing_weekly", headers=H).json()["key"] == "marketing_weekly"
+        ws = c.post("/workspaces", headers=H, json={"name": "Onboarding Export WS"}).json()
+        H = {**H, "X-Workspace-Id": str(ws["id"])}
         pv = c.post("/onboarding/preview", headers=H, files={"file": ("client.csv", csv, "text/csv")}).json()
         assert pv["status"] == "READY"
         assert c.post("/onboarding/datasets", headers=H, files={"file": ("client.csv", csv, "text/csv")},
