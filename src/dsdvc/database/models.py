@@ -140,6 +140,40 @@ class ResearchProjectMemory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class DatasetVersion(Base):
+    """An onboarded dataset: canonical data stored by content hash, with mapping, scorecard and attestation."""
+    __tablename__ = "dataset_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    dataset: Mapped[str] = mapped_column(String(50))
+    filename: Mapped[str] = mapped_column(String(300))
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    rows: Mapped[int] = mapped_column(Integer)
+    mapping: Mapped[dict] = mapped_column(JSON)
+    scorecard: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(30))
+    attestation: Mapped[str] = mapped_column(Text)
+    storage_path: Mapped[str] = mapped_column(String(500))
+    uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class MMMRun(Base):
+    __tablename__ = "mmm_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    dataset_version_id: Mapped[int | None] = mapped_column(ForeignKey("dataset_versions.id"), nullable=True)
+    spec: Mapped[dict] = mapped_column(JSON)
+    diagnostics: Mapped[dict] = mapped_column(JSON)
+    channel_summary: Mapped[dict] = mapped_column(JSON)
+    backtest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    model_version: Mapped[str] = mapped_column(String(64))
+    data_version: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(primary_key=True)

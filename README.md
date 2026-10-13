@@ -21,7 +21,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt && pip install -e .
 
-pytest                                   # 81 tests: unit, integration, simulation, API, calibration, forecast, legacy regression
+pytest                                   # 95 tests: unit, integration, simulation, MMM, onboarding, exports, API, legacy regression
 
 uvicorn api.main:app --reload            # REST API  -> http://localhost:8000/docs
 streamlit run dashboard/app.py           # dashboard -> http://localhost:8501
@@ -30,6 +30,25 @@ python scripts/demo_research.py --synthetic   # end-to-end research report (labe
 
 The API needs a first admin key. Generate one with `make admin-key` and set it as
 `DSDVC_BOOTSTRAP_ADMIN_KEY` in `.env` before the first start (see [docs/API.md](docs/API.md)).
+
+## Client workflow (start here)
+
+The dashboard opens on **Client workflow**, the guided path for a paying engagement:
+
+**Brief → Data → Model → Plan → Export**
+
+1. **Data**: upload the client's weekly export (CSV/Excel). Columns are mapped automatically
+   (₹ / lakh / crore and DD/MM/YYYY handled), validated (READY / WARNINGS / BLOCKED), and stored with a
+   SHA-256 and an authorisation note.
+2. **Model**: Bayesian marketing mix model (adstock + saturation, trend, seasonality, controls,
+   optional lift-test calibration) with a **back-test on hidden recent weeks**. Its PASS / CAUTION / FAIL
+   verdict is shown before any plan.
+3. **Plan**: budget optimiser with limits, expected gain, 90% interval and probability of beating the current mix.
+4. **Export**: client-ready **Excel media plan** and editable **PowerPoint deck**.
+
+Try it with *Load sample client file (SYNTHETIC)*. Method: [docs/MMM.md](docs/MMM.md) ·
+Guide for client data teams: [docs/CLIENT_ONBOARDING.md](docs/CLIENT_ONBOARDING.md).
+The original research tools (simulation, virality, influencers, etc.) are under **Research lab**.
 
 ## Deploy
 
@@ -54,12 +73,14 @@ Details: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 | Diffusion | `dsdvc.diffusion` | Bass (NLS/MLE/generalised), event-driven multiplex ABM (`MarketSimulator`) with journey state machine, MNL competition, churn, LTV |
 | Economics | `conversion`, `churn`, `competition`, `attribution` | Platform-specific conversion β, churn model + breakdowns, CLV, MNL with log/power network effects, 7 attribution models + incrementality tests |
 | Science workflow | `calibration`, `validation`, `experiments`, `forecasting`, `optimization` | MLE/NLS/MCMC/ABC/SBC, rolling-origin benchmarks, ablation report, Monte Carlo/LHS/Sobol/Morris/A-B, counterfactuals, 7–90-day forecasts, PELT regimes, early warnings, budget optimiser |
+| MMM | `dsdvc.mmm` | Adstock + Hill saturation MMM, MAP + Laplace posterior, lift-test calibration, ROI/mROI with intervals, response curves, budget optimiser, back-test verdicts |
+| Onboarding & exports | `dsdvc.onboarding`, `dsdvc.exports` | Data templates, automatic column mapping, validation scorecard, versioned datasets with attestation; Excel media plan and PowerPoint deck |
 | Agent | `dsdvc.research_agent` | 14-step `MarketingResearchAgent`, 12 tools, traceable `ResearchMemory`, 24-section report, optional Claude narrator with a numeric anti-fabrication guard |
 | Serving | `dsdvc.api`, `dsdvc.dashboard`, `dsdvc.database` | FastAPI (roles: admin/analyst/viewer), Streamlit (22 tabs), SQLAlchemy (PostgreSQL/SQLite), Prometheus metrics, Redis cache, MLflow logging |
 
 ## Documentation
 
-[Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
+[MMM method](docs/MMM.md) · [Client onboarding](docs/CLIENT_ONBOARDING.md) · [Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
 [API](docs/API.md) · [Calibration](docs/CALIBRATION.md) · [Validation](docs/VALIDATION.md) ·
 [Literature](docs/LITERATURE.md) ([per-paper summaries](docs/literature/)) · [Deployment](docs/DEPLOYMENT.md) · [Ethics](docs/ETHICS.md)
 

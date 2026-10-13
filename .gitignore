@@ -11,3 +11,4 @@ research_memory/
 *.egg-info/
 .claude/
 .streamlit/secrets.toml
+data_store/

@@ -17,6 +17,8 @@
 ## Components and what they output
 | Component | Output | Status label |
 |---|---|---|
+| Marketing mix model | channel contribution, ROI, marginal ROI, response curves (90% intervals); back-test verdict | ESTIMATED |
+| MMM budget optimiser | weekly mix, uplift interval, P(better than current) | RECOMMENDED |
 | Bass NLS / MLE / MCMC | p, q, m with intervals | ESTIMATED / CALIBRATED |
 | `MarketSimulator` | adoption, churn, revenue, cost, CAC, ROI paths | SIMULATED |
 | `ViralityPredictor` | P(top-x% within benchmark group), expected views/shares/conversions/retention | PREDICTED |

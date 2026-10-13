@@ -6,6 +6,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dsdvc.core.runtime import configure_threads  # noqa: E402
 
 configure_threads()  # cap OpenMP/BLAS threads at the container's real CPU quota before numpy/lightgbm load
-from dsdvc.dashboard.app import main  # noqa: E402
+import streamlit as st  # noqa: E402
 
-main()
+from dsdvc.dashboard.app import main as research_lab  # noqa: E402
+from dsdvc.dashboard.workflow import workflow_page  # noqa: E402
+
+st.set_page_config(page_title="DSDVC Marketing Intelligence", layout="wide")
+st.navigation([st.Page(workflow_page, title="Client workflow", icon=":material/work:", default=True),
+               st.Page(research_lab, title="Research lab", icon=":material/science:", url_path="lab")]).run()

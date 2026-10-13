@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -417,6 +417,177 @@ def connectors(u: User = Depends(require("viewer"))):
             "whatsapp_business_platform": bool(s.whatsapp_business_token and s.whatsapp_business_account_id),
             "meta_content_library": "approved-researcher exports only",
             "note": "Unconfigured connectors return DATA_UNAVAILABLE; DSDVC never scrapes or bypasses access controls."}
+
+
+# ------------------------------------------------------------------ onboarding → MMM → exports
+MMM_RUNS: dict[int, dict] = {}
+
+
+def _read_upload(raw: bytes, filename: str) -> pd.DataFrame:
+    import io
+    if filename.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(io.BytesIO(raw), dtype=str)
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), dtype=str, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise HTTPException(422, "could not decode file")
+
+
+@app.get("/onboarding/templates/{key}")
+def onboarding_template(key: str, u: User = Depends(require("viewer"))):
+    from dsdvc.onboarding.templates import TEMPLATES, template_frame
+    if key not in TEMPLATES:
+        raise HTTPException(404, f"unknown template; choose from {list(TEMPLATES)}")
+    spec = TEMPLATES[key]
+    return {"key": key, "title": spec.title, "grain": spec.grain, "purpose": spec.purpose,
+            "dictionary": spec.dictionary().to_dict(orient="records"),
+            "example_csv": template_frame(key).to_csv(index=False)}
+
+
+@app.post("/onboarding/preview")
+async def onboarding_preview(file: UploadFile = File(...), mapping: str | None = Form(None),
+                             u: User = Depends(require("analyst"))):
+    """Suggest (or apply a supplied) column mapping and return the validation scorecard. Stores nothing."""
+    import json
+    from dsdvc.onboarding.mapping import ColumnMatch, Mapping, apply_mapping, suggest_mapping
+    from dsdvc.onboarding.templates import MARKETING_WEEKLY
+    from dsdvc.onboarding.validate import validate
+    raw = _read_upload(await file.read(), file.filename)
+    m = suggest_mapping(raw, MARKETING_WEEKLY)
+    if mapping:
+        user_map = json.loads(mapping)
+        m = Mapping("marketing_weekly", [ColumnMatch(c, user_map.get(c, "(ignore)"), 1.0, "supplied") for c in raw.columns])
+    canon, notes = apply_mapping(raw, m, MARKETING_WEEKLY)
+    sc = validate(canon, MARKETING_WEEKLY)
+    return json_safe({"mapping": m.table().to_dict(orient="records"), "parse_notes": notes, "status": sc.status,
+                      "score": sc.score, "checks": sc.table().to_dict(orient="records"),
+                      "preview": canon.head(10).astype(str).to_dict(orient="records")})
+
+
+@app.post("/onboarding/datasets")
+async def onboarding_save(file: UploadFile = File(...), attestation: str = Form(...), mapping: str | None = Form(None),
+                          project_id: int | None = Form(None), u: User = Depends(require("analyst")), db=Depends(get_db)):
+    import json
+    from dsdvc.onboarding.mapping import ColumnMatch, Mapping, apply_mapping, suggest_mapping
+    from dsdvc.onboarding.templates import MARKETING_WEEKLY
+    from dsdvc.onboarding.validate import validate
+    from dsdvc.onboarding.workspace import save_dataset
+    raw = _read_upload(await file.read(), file.filename)
+    m = suggest_mapping(raw, MARKETING_WEEKLY)
+    if mapping:
+        user_map = json.loads(mapping)
+        m = Mapping("marketing_weekly", [ColumnMatch(c, user_map.get(c, "(ignore)"), 1.0, "supplied") for c in raw.columns])
+    canon, _ = apply_mapping(raw, m, MARKETING_WEEKLY)
+    sc = validate(canon, MARKETING_WEEKLY)
+    try:
+        row = save_dataset(db, df=canon, dataset="marketing_weekly", filename=file.filename, mapping=m, scorecard=sc,
+                           attestation=attestation, project_id=project_id, user_id=u.id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {"dataset_id": row.id, "sha256": row.sha256, "rows": row.rows, "status": row.status, "mapping": row.mapping}
+
+
+class MMMFitIn(BaseModel):
+    dataset_id: int
+    target: Literal["revenue", "conversions"] = "revenue"
+    channels: list[str] | None = None
+    controls: list[str] | None = None
+    holdout_weeks: int = Field(12, ge=0, le=52)
+    lift_tests: list[dict] = []
+
+
+@app.post("/mmm/fit")
+def mmm_fit(body: MMMFitIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+    from dsdvc.database.models import DatasetVersion, MMMRun
+    from dsdvc.mmm import analysis as AN
+    from dsdvc.mmm.model import LiftTest, MarketingMixModel, MMMSpec
+    from dsdvc.onboarding.validate import spend_columns
+    from dsdvc.onboarding.workspace import load_dataset
+    row = db.get(DatasetVersion, body.dataset_id)
+    if row is None:
+        raise HTTPException(404, "dataset not found")
+    df = load_dataset(row)
+    if body.target not in df:
+        raise HTTPException(422, f"dataset has no '{body.target}' column")
+    chans = body.channels or spend_columns(df)
+    ctrls = body.controls if body.controls is not None else [c for c in ("price_index", "promo", "holiday", "competitor_spend") if c in df]
+    lifts = [LiftTest(l["channel"] if l["channel"].startswith("spend_") else f"spend_{l['channel']}", pd.Timestamp(l["start"]),
+                      pd.Timestamp(l["end"]), float(l["lift"]), float(l["se"])) for l in body.lift_tests]
+    spec = MMMSpec(target_col=body.target, channels=chans, controls=ctrls)
+    with METRICS.timer("dsdvc_model_latency", model="mmm_fit"):
+        fit = MarketingMixModel(spec).fit(df, lifts, data_version=row.sha256[:16])
+        bt = AN.backtest(MarketingMixModel(spec), df, body.holdout_weeks, lifts) if body.holdout_weeks else None
+    summ = AN.channel_summary(fit)
+    run = MMMRun(project_id=row.project_id, dataset_version_id=row.id, spec=json_safe(spec.__dict__),
+                 diagnostics=json_safe(fit.diagnostics), channel_summary=json_safe(summ.to_dict(orient="records")),
+                 backtest=json_safe({"verdict": bt.verdict, **bt.metrics}) if bt else None,
+                 model_version=fit.model_version, data_version=fit.data_version, created_by=u.id)
+    db.add(run)
+    db.commit()
+    MMM_RUNS[run.id] = {"fit": fit, "bt": bt, "summary": summ, "dataset": row}
+    return json_safe({"run_id": run.id, "status": "ESTIMATED", "diagnostics": fit.diagnostics,
+                      "backtest": {"verdict": bt.verdict, **bt.metrics} if bt else None,
+                      "channels": summ.to_dict(orient="records"), **meta(fit.data_version)})
+
+
+class PlanIn(BaseModel):
+    weekly_budget: float | None = None
+    objective: Literal["outcome", "profit"] = "outcome"
+    max_change: float = Field(0.5, gt=0, le=1)
+    margin: float = Field(1.0, gt=0, le=1)
+
+
+def _run(run_id: int) -> dict:
+    if run_id not in MMM_RUNS:
+        raise HTTPException(404, "run not in memory (fitted models are kept in memory; refit after a restart)")
+    return MMM_RUNS[run_id]
+
+
+@app.post("/mmm/{run_id}/plan")
+def mmm_plan(run_id: int, body: PlanIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+    from dsdvc.database.models import MMMRun
+    from dsdvc.mmm import analysis as AN
+    r = _run(run_id)
+    plan = AN.optimize_budget(r["fit"], body.weekly_budget, max_change=body.max_change, objective=body.objective, margin=body.margin)
+    r["plan"] = plan
+    out = {"weekly_budget": plan.weekly_budget, "objective": plan.objective, "uplift": plan.uplift, "uplift_low": plan.uplift_low,
+           "uplift_high": plan.uplift_high, "p_better": plan.p_better, "notes": plan.notes,
+           "table": plan.table.to_dict(orient="records")}
+    row = db.get(MMMRun, run_id)
+    if row is not None:
+        row.plan = json_safe(out)
+        db.commit()
+    return json_safe({"status": "RECOMMENDED", **out, **meta(r["fit"].data_version)})
+
+
+@app.get("/mmm/{run_id}/export/{fmt}")
+def mmm_export(run_id: int, fmt: Literal["xlsx", "pptx"], client: str = "Client", horizon_weeks: int = 13,
+               start: str | None = None, currency: str = "₹", u: User = Depends(require("viewer"))):
+    import datetime as dt
+    from fastapi.responses import Response
+    from dsdvc.mmm import analysis as AN
+    r = _run(run_id)
+    if "plan" not in r:
+        raise HTTPException(409, "create a plan first: POST /mmm/{run_id}/plan")
+    fit, ds = r["fit"], r["dataset"]
+    prov = {"filename": ds.filename, "rows": ds.rows, "sha256": ds.sha256, "validation": ds.status, "attestation": ds.attestation,
+            "data_version": fit.data_version, "lift_tests": len(fit.lift_tests)}
+    start_d = dt.date.fromisoformat(start) if start else dt.date.today()
+    if fmt == "xlsx":
+        from dsdvc.exports.excel import media_plan_workbook
+        data = media_plan_workbook(client=client, plan=r["plan"], summary=r["summary"], curves=AN.response_curves(fit),
+                                   backtest=r["bt"], params=AN.channel_params(fit), horizon_weeks=horizon_weeks, start=start_d,
+                                   diagnostics=fit.diagnostics, provenance=prov, currency=currency)
+        mt = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        from dsdvc.exports.deck import executive_deck
+        data = executive_deck(client=client, plan=r["plan"], summary=r["summary"], decomposition=AN.decomposition(fit),
+                              backtest=r["bt"], diagnostics=fit.diagnostics, provenance=prov, horizon_weeks=horizon_weeks,
+                              outcome_label=fit.spec.target_col, currency=currency)
+        mt = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    return Response(data, media_type=mt, headers={"Content-Disposition": f'attachment; filename="mmm_run_{run_id}.{fmt}"'})
 
 
 # ------------------------------------------------------------------ research agent (async job)

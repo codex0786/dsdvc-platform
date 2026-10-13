@@ -25,3 +25,6 @@ redis>=5
 mlflow-skinny>=2.14
 # Optional LLM narration of reports
 anthropic>=0.70
+openpyxl>=3.1
+python-pptx>=1.0
+python-multipart>=0.0.9

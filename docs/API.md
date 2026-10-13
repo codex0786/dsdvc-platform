@@ -24,6 +24,12 @@ Interactive docs: `http://localhost:8000/docs` (OpenAPI).
 | `POST /attribution` · `POST /attribution/incrementality` | viewer | attributed vs incremental conversions |
 | `POST /forecast` · `POST /regime` · `POST /data-quality` | analyst / viewer | forecasts, regime + alerts, quality score |
 | `GET /connectors/status` | viewer | which official connectors are configured |
+| `GET /onboarding/templates/{key}` | viewer | data dictionary + example CSV (`marketing_weekly`, `lift_tests`) |
+| `POST /onboarding/preview` (multipart `file`, optional `mapping` JSON) | analyst | suggested mapping, parse notes, validation scorecard; stores nothing |
+| `POST /onboarding/datasets` (multipart `file`, `attestation`, optional `mapping`) | analyst | stores a validated dataset version (422 if BLOCKED or no attestation) |
+| `POST /mmm/fit` | analyst | fit MMM + back-test on a stored dataset (optional `lift_tests`) → `run_id`, ROI, verdict |
+| `POST /mmm/{run_id}/plan` | analyst | budget optimisation → recommended mix, uplift interval, P(better) |
+| `GET /mmm/{run_id}/export/{xlsx\|pptx}` | viewer | Excel media plan / PowerPoint deck |
 | `POST /research` · `GET /research/{job_id}` | analyst / viewer | async research-agent job → plan, traced recommendations, Markdown report |
 
 Every model response includes `model_version`, `simulation_version`, `data_version`, `timestamp`.

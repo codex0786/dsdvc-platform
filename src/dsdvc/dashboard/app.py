@@ -247,7 +247,6 @@ def read_upload(label: str, key: str) -> pd.DataFrame | None:
 
 # ------------------------------------------------------------------ app
 def main():
-    st.set_page_config(page_title="DSDVC Marketing Intelligence", layout="wide")
     st.title("DSDVC — Social Diffusion, Virality, Conversion & Marketing Intelligence")
     from dsdvc.core.runtime import available_cpus
     st.caption(f"v{__version__} · {MODEL_VERSION} · {available_cpus()} CPU thread(s) · Decision support, not a vanity-metrics dashboard: "
