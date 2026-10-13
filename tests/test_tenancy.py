@@ -349,3 +349,17 @@ def test_concurrent_first_start_migrates_once(tmp_path):
     assert not errors, errors
     with create_engine(url).connect() as c:
         assert c.execute(text("select version_num from alembic_version")).scalar() == "0001"
+
+
+def test_half_built_database_from_interrupted_start_is_repaired(tmp_path):
+    """Tables exist and alembic_version exists but holds no row (crash mid first start)."""
+    from dsdvc.database import migrate
+    from dsdvc.database.models import Base
+    eng = create_engine(f"sqlite:///{tmp_path}/half.db")
+    Base.metadata.create_all(eng)
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+    res = migrate.upgrade(eng)
+    assert res["mode"] == "legacy-sync+stamp"
+    with eng.connect() as c:
+        assert c.execute(text("select version_num from alembic_version")).scalar() == "0001"

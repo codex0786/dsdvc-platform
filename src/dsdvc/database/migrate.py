@@ -87,7 +87,13 @@ def _upgrade(engine) -> dict:
         tables = set(inspect(conn).get_table_names())
         cfg = alembic_config()
         cfg.attributes["connection"] = conn
-        if tables and "alembic_version" not in tables:
+        app_tables = tables - {"alembic_version"}
+        version = None
+        if "alembic_version" in tables:
+            version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        if app_tables and version is None:
+            # pre-migration database, or one left half-built by an interrupted first start
+            # (tables created, no version recorded): repair additively, then record the version
             added = _additive_sync(conn)
             command.stamp(cfg, "head")
             return {"mode": "legacy-sync+stamp", "added_columns": added}
