@@ -313,11 +313,13 @@ def test_legacy_database_is_upgraded_without_data_loss(tmp_path):
     with eng.begin() as c:
         c.execute(text("ALTER TABLE users DROP COLUMN last_login_at"))  # unindexed column (SQLite cannot drop indexed ones)
         c.execute(text("INSERT INTO organizations (name, created_at) VALUES ('Old Org', '2025-01-01')"))
+    from dsdvc.database import migrate
     res = upgrade(eng)
     assert res["mode"] == "legacy-sync+stamp" and "users.last_login_at" in res["added_columns"]
     with eng.connect() as c:
         assert c.execute(text("select count(*) from organizations")).scalar() == 1
         assert c.execute(text("select version_num from alembic_version")).scalar() == "0001"
+    migrate._DONE.discard(str(eng.url))
     assert upgrade(eng)["mode"] == "alembic-upgrade"
 
 
@@ -326,3 +328,24 @@ def test_fresh_database_via_alembic(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path}/fresh.db")
     assert upgrade(eng)["mode"] == "alembic-upgrade"
     assert {"memberships", "projects", "dataset_versions", "audit_log"} <= set(inspect(eng).get_table_names())
+
+
+def test_concurrent_first_start_migrates_once(tmp_path):
+    """Several sessions starting at once on a fresh database must not race on CREATE TABLE."""
+    import threading
+    from dsdvc.database import migrate
+    url = f"sqlite:///{tmp_path}/race.db"
+    errors = []
+
+    def start():
+        try:
+            migrate._DONE.discard(url)
+            migrate.upgrade(create_engine(url))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    ts = [threading.Thread(target=start) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors, errors
+    with create_engine(url).connect() as c:
+        assert c.execute(text("select version_num from alembic_version")).scalar() == "0001"

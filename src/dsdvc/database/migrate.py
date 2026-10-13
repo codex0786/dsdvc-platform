@@ -1,6 +1,8 @@
 """Schema migrations (Alembic) with a safe path for databases created before migrations existed."""
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from alembic import command
@@ -38,7 +40,49 @@ def _additive_sync(conn) -> list[str]:
     return done
 
 
+_PROCESS_LOCK = threading.Lock()
+_DONE: set[str] = set()
+
+
+@contextmanager
+def _migration_lock(engine):
+    """Serialise migrations across threads and processes: a PostgreSQL advisory lock, or an exclusive
+    file lock next to a SQLite database."""
+    with _PROCESS_LOCK:
+        if engine.dialect.name == "postgresql":
+            with engine.connect() as c:
+                c.execute(text("SELECT pg_advisory_lock(727274)"))
+                try:
+                    yield
+                finally:
+                    c.execute(text("SELECT pg_advisory_unlock(727274)"))
+            return
+        db_path = engine.url.database
+        if engine.dialect.name == "sqlite" and db_path and db_path != ":memory:":
+            import fcntl
+            with open(f"{db_path}.migrate.lock", "w") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+            return
+        yield
+
+
 def upgrade(engine) -> dict:
+    key = str(engine.url)
+    if key in _DONE:
+        return {"mode": "already-current-in-process"}
+    with _migration_lock(engine):
+        if key in _DONE:
+            return {"mode": "already-current-in-process"}
+        res = _upgrade(engine)
+        _DONE.add(key)
+        return res
+
+
+def _upgrade(engine) -> dict:
     with engine.begin() as conn:
         tables = set(inspect(conn).get_table_names())
         cfg = alembic_config()
