@@ -23,7 +23,7 @@ class FakeSession:
     def __init__(self, responses):
         self.responses, self.calls = list(responses), []
 
-    def get(self, url, params=None, timeout=None):
+    def request(self, method, url, params=None, timeout=None, **kw):
         self.calls.append((url, params))
         return self.responses.pop(0)
 

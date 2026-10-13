@@ -13,7 +13,12 @@ For the client's marketing or data team, and the analyst running the engagement.
 | 5 · Export | Analyst | Download the Excel media plan and executive deck; log the run | `.xlsx` + `.pptx` + run record |
 | 6 · Prove | Client + analyst | Geo-lift / conversion-lift test on the biggest recommended shift | Lift result, uploaded as a calibration input |
 
-## What data to send
+## Fastest route: connect the accounts
+
+Grant read access to Meta Ads, GA4 and Shopify ([how](CONNECTORS.md)). The platform then pulls and
+reconciles the history itself. Channels without an API (TV, OOH, print) are added as small CSVs.
+
+## What data to send (file route)
 
 One row per **week** (Monday week-start preferred), ideally **104+ weeks** (minimum 26).
 

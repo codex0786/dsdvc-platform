@@ -37,7 +37,8 @@ The dashboard opens on **Client workflow**, the guided path for a paying engagem
 
 **Brief → Data → Model → Plan → Export**
 
-1. **Data**: upload the client's weekly export (CSV/Excel). Columns are mapped automatically
+1. **Data**: **pull directly from Meta Ads, GA4 and Shopify** ([setup](docs/CONNECTORS.md)), or upload the
+   client's weekly export (CSV/Excel). Columns are mapped automatically
    (₹ / lakh / crore and DD/MM/YYYY handled), validated (READY / WARNINGS / BLOCKED), and stored with a
    SHA-256 and an authorisation note.
 2. **Model**: Bayesian marketing mix model (adstock + saturation, trend, seasonality, controls,
@@ -74,13 +75,14 @@ Details: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 | Economics | `conversion`, `churn`, `competition`, `attribution` | Platform-specific conversion β, churn model + breakdowns, CLV, MNL with log/power network effects, 7 attribution models + incrementality tests |
 | Science workflow | `calibration`, `validation`, `experiments`, `forecasting`, `optimization` | MLE/NLS/MCMC/ABC/SBC, rolling-origin benchmarks, ablation report, Monte Carlo/LHS/Sobol/Morris/A-B, counterfactuals, 7–90-day forecasts, PELT regimes, early warnings, budget optimiser |
 | MMM | `dsdvc.mmm` | Adstock + Hill saturation MMM, MAP + Laplace posterior, lift-test calibration, ROI/mROI with intervals, response curves, budget optimiser, back-test verdicts |
+| Connectors | `dsdvc.connectors` | Meta Marketing API (official MMM export), GA4 Data API, Shopify Admin GraphQL (bulk orders); weekly assembly with time zones, channel rules, GA4↔Shopify reconciliation; SYNTHETIC API simulators for demo/tests |
 | Onboarding & exports | `dsdvc.onboarding`, `dsdvc.exports` | Data templates, automatic column mapping, validation scorecard, versioned datasets with attestation; Excel media plan and PowerPoint deck |
 | Agent | `dsdvc.research_agent` | 14-step `MarketingResearchAgent`, 12 tools, traceable `ResearchMemory`, 24-section report, optional Claude narrator with a numeric anti-fabrication guard |
 | Serving | `dsdvc.api`, `dsdvc.dashboard`, `dsdvc.database` | FastAPI (roles: admin/analyst/viewer), Streamlit (22 tabs), SQLAlchemy (PostgreSQL/SQLite), Prometheus metrics, Redis cache, MLflow logging |
 
 ## Documentation
 
-[MMM method](docs/MMM.md) · [Client onboarding](docs/CLIENT_ONBOARDING.md) · [Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
+[MMM method](docs/MMM.md) · [Connectors](docs/CONNECTORS.md) · [Client onboarding](docs/CLIENT_ONBOARDING.md) · [Architecture](docs/ARCHITECTURE.md) · [Model card](docs/MODEL_CARD.md) · [Data card](docs/DATA_CARD.md) ·
 [API](docs/API.md) · [Calibration](docs/CALIBRATION.md) · [Validation](docs/VALIDATION.md) ·
 [Literature](docs/LITERATURE.md) ([per-paper summaries](docs/literature/)) · [Deployment](docs/DEPLOYMENT.md) · [Ethics](docs/ETHICS.md)
 
@@ -94,7 +96,7 @@ Verified on 2026-10-09 (macOS, Python 3.12):
 | tests pass | ✅ 81 passed locally; CI on Python 3.11 + 3.12: 79 passed, 2 skipped (legacy golden values recorded on a different numpy build; checksum and mechanics tests still run) |
 | baseline (legacy) model runs | ✅ v2 + v3 byte-identical to originals (SHA-256), golden-output regression tests |
 | calibration works | ✅ Bass NLS/MLE/MCMC recover planted p, q, m; ABC recovers identifiable parameters and flags weakly identified ones |
-| real/authorised data connectors work where credentials exist | ⚠️ implemented against Meta's documented Graph API and tested with mocked HTTP; **not exercised against live Meta accounts** (no credentials here) |
+| real/authorised data connectors work where credentials exist | ⚠️ Meta Ads, GA4, Shopify (+ organic Meta) implemented against current official API docs and tested against API-shaped simulators; **not yet run against live client accounts** |
 | unavailable data handled gracefully | ✅ `DATA_UNAVAILABLE` end to end (connectors → tools → agent → report → API) |
 | network / influencer / content / virality / conversion / churn / forecasting / counterfactual | ✅ each covered by tests that check recovery of planted effects |
 | dashboard works | ✅ all 22 tabs render with 0 exceptions (verified in browser) |

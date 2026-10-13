@@ -72,6 +72,11 @@ def suggest_mapping(df: pd.DataFrame, spec: DatasetSpec, sample_rows: int = 50) 
         norm = normalise(col)
         values = df[col].dropna().astype(str).head(sample_rows)
         numeric_share = values.map(lambda v: _parse_number(v) is not None).mean() if len(values) else 0
+        # 0) already-canonical channel spend column (e.g. produced by the API connectors)
+        if spec.channel_pattern and re.fullmatch(r"spend_[a-z0-9_]+", norm) and numeric_share > 0.8 and norm not in used:
+            used.add(norm)
+            out.matches.append(ColumnMatch(col, norm, 1.0, "canonical spend column"))
+            continue
         # 1) explicit canonical / synonym match
         cand = None
         for c in spec.columns:

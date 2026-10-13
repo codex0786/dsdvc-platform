@@ -28,3 +28,4 @@ anthropic>=0.70
 openpyxl>=3.1
 python-pptx>=1.0
 python-multipart>=0.0.9
+google-auth>=2.30

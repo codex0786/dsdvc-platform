@@ -31,6 +31,12 @@ class RateLimitExceeded(RuntimeError):
     pass
 
 
+def _redact(text: str) -> str:
+    """Strip anything that looks like a credential from error text before it is surfaced."""
+    import re
+    return re.sub(r"(access_token=|token\W+)[A-Za-z0-9_\-\.]{8,}", r"\1***", text)
+
+
 class Connector(ABC):
     name: str = "connector"
     source_type: SourceType = SourceType.AUTHORIZED_API
@@ -52,7 +58,7 @@ class Connector(ABC):
     # -- polite HTTP with rate-limit compliance
     def _usage_pct(self, headers) -> float:
         pct = 0.0
-        for h in ("x-app-usage", "x-business-use-case-usage", "x-ad-account-usage"):
+        for h in ("x-app-usage", "x-business-use-case-usage", "x-ad-account-usage", "x-fb-ads-insights-throttle"):
             raw = headers.get(h) or headers.get(h.title())
             if not raw:
                 continue
@@ -72,12 +78,26 @@ class Connector(ABC):
             pct = max([pct] + vals)
         return pct
 
-    def get(self, url: str, params: dict) -> dict | DataUnavailable:
+    def get(self, url: str, params: dict | None = None, headers: dict | None = None, raw: bool = False):
+        return self._request("GET", url, params=params, headers=headers, raw=raw)
+
+    def post(self, url: str, data: dict | None = None, json: dict | None = None, headers: dict | None = None,
+             params: dict | None = None):
+        return self._request("POST", url, params=params, data=data, json=json, headers=headers)
+
+    def _request(self, method: str, url: str, raw: bool = False, **kw) -> dict | DataUnavailable:
+        kw = {k: v for k, v in kw.items() if v is not None}
         for attempt in range(self.max_retries):
             try:
-                r = self.session.get(url, params=params, timeout=30)
+                r = self.session.request(method, url, timeout=60, **kw)
             except Exception as e:  # noqa: BLE001
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                 return unavailable(url.split("?")[0], f"network error: {type(e).__name__}")
+            if r.status_code >= 500 and attempt < self.max_retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
             usage = self._usage_pct(r.headers)
             if r.status_code == 429 or usage >= 100:
                 wait = min(60 * (attempt + 1), 300)
@@ -91,6 +111,6 @@ class Connector(ABC):
                 return unavailable(url.split("?")[0], f"not authorised ({r.status_code})",
                                    "Check token permissions / app review; DSDVC will not bypass access controls.")
             if r.status_code >= 400:
-                return unavailable(url.split("?")[0], f"HTTP {r.status_code}: {r.text[:200]}")
-            return r.json()
+                return unavailable(url.split("?")[0], f"HTTP {r.status_code}: {_redact(r.text[:300])}")
+            return r if raw else r.json()
         return unavailable(url.split("?")[0], "rate limit persisted after compliant back-off")

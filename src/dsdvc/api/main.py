@@ -411,8 +411,10 @@ def data_quality(body: DailyIn, u: User = Depends(require("viewer"))):
 
 @app.get("/connectors/status")
 def connectors(u: User = Depends(require("viewer"))):
+    from dsdvc.connectors.credentials import status as conn_status
     s = get_settings()
-    return {"instagram_graph_api": bool(s.meta_access_token and s.instagram_business_account_id),
+    return {**{f"{k}_connector": v for k, v in conn_status(s).items()},
+            "instagram_graph_api": bool(s.meta_access_token and s.instagram_business_account_id),
             "facebook_pages_api": bool(s.meta_access_token and s.facebook_page_id),
             "whatsapp_business_platform": bool(s.whatsapp_business_token and s.whatsapp_business_account_id),
             "meta_content_library": "approved-researcher exports only",
@@ -588,6 +590,61 @@ def mmm_export(run_id: int, fmt: Literal["xlsx", "pptx"], client: str = "Client"
                               outcome_label=fit.spec.target_col, currency=currency)
         mt = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     return Response(data, media_type=mt, headers={"Content-Disposition": f'attachment; filename="mmm_run_{run_id}.{fmt}"'})
+
+
+class PullIn(BaseModel):
+    start: str
+    end: str
+    sources: list[Literal["meta", "ga4", "shopify"]] = ["meta", "ga4", "shopify"]
+    meta_mode: Literal["mmm", "insights"] = "mmm"
+    campaign_rules: list[tuple[str, str]] = []
+    split_platforms: bool = False
+    outcome_source: Literal["auto", "shopify", "ga4"] = "auto"
+    demo: bool = False
+    save: bool = False
+    attestation: str | None = None
+    project_id: int | None = None
+
+
+@app.post("/connectors/pull")
+def connectors_pull(body: PullIn, u: User = Depends(require("analyst")), db=Depends(get_db)):
+    """Pull Meta Ads / GA4 / Shopify for a date range and assemble the weekly MMM dataset.
+    ``demo=true`` uses the labelled SYNTHETIC API simulators. ``save=true`` stores it as a dataset version."""
+    import datetime as dt
+    from dsdvc.connectors import credentials as C
+    from dsdvc.connectors.meta_ads import ChannelRules
+    from dsdvc.connectors.pull import pull_weekly
+    from dsdvc.onboarding.mapping import suggest_mapping
+    from dsdvc.onboarding.templates import MARKETING_WEEKLY
+    from dsdvc.onboarding.validate import validate
+    start, end = dt.date.fromisoformat(body.start), dt.date.fromisoformat(body.end)
+    if start >= end:
+        raise HTTPException(422, "start must be before end")
+    with METRICS.timer("dsdvc_connector_latency", source="+".join(body.sources)):
+        res, errors = pull_weekly(C.connectors(demo=body.demo), start, end, list(body.sources), meta_mode=body.meta_mode,
+                                  rules=ChannelRules(campaign_contains=list(body.campaign_rules), split_platforms=body.split_platforms),
+                                  outcome_source=body.outcome_source)
+    for k in errors:
+        METRICS.inc("dsdvc_ingestion_failures", source=k)
+    if res is None:
+        return json_safe({"status": "DATA_UNAVAILABLE", "errors": errors})
+    sc = validate(res.data, MARKETING_WEEKLY)
+    out = {"status": sc.status, "rows": len(res.data), "columns": res.column_sources, "warnings": res.warnings,
+           "errors": errors, "checks": sc.table().to_dict(orient="records"), "data_status": "SYNTHETIC" if body.demo else "OBSERVED",
+           "reconciliation": res.reconciliation.to_dict(orient="records") if res.reconciliation is not None else None,
+           "data": res.data.assign(date=res.data.date.dt.strftime("%Y-%m-%d")).to_dict(orient="records")}
+    if body.save:
+        from dsdvc.onboarding.workspace import save_dataset
+        att = (body.attestation or res.attestation_text()) + (" [SYNTHETIC demo accounts]" if body.demo else "")
+        try:
+            row = save_dataset(db, df=res.data, dataset="marketing_weekly",
+                               filename=f"api_pull_{'_'.join(body.sources)}_{start}_{end}",
+                               mapping=suggest_mapping(res.data, MARKETING_WEEKLY), scorecard=sc, attestation=att,
+                               project_id=body.project_id, user_id=u.id)
+            out["dataset_id"] = row.id
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+    return json_safe(out)
 
 
 # ------------------------------------------------------------------ research agent (async job)

@@ -24,6 +24,7 @@ Interactive docs: `http://localhost:8000/docs` (OpenAPI).
 | `POST /attribution` · `POST /attribution/incrementality` | viewer | attributed vs incremental conversions |
 | `POST /forecast` · `POST /regime` · `POST /data-quality` | analyst / viewer | forecasts, regime + alerts, quality score |
 | `GET /connectors/status` | viewer | which official connectors are configured |
+| `POST /connectors/pull` | analyst | pull Meta Ads / GA4 / Shopify for a date range → weekly MMM dataset, column sources, reconciliation, validation; `demo=true` uses SYNTHETIC simulators; `save=true` stores a dataset version |
 | `GET /onboarding/templates/{key}` | viewer | data dictionary + example CSV (`marketing_weekly`, `lift_tests`) |
 | `POST /onboarding/preview` (multipart `file`, optional `mapping` JSON) | analyst | suggested mapping, parse notes, validation scorecard; stores nothing |
 | `POST /onboarding/datasets` (multipart `file`, `attestation`, optional `mapping`) | analyst | stores a validated dataset version (422 if BLOCKED or no attestation) |

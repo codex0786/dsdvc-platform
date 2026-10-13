@@ -60,6 +60,102 @@ def _money(v, cur):
     return f"{cur}{v:,.0f}"
 
 
+def _default_range(demo: bool) -> tuple[dt.date, dt.date]:
+    if demo:
+        return dt.date(2023, 1, 2), dt.date(2025, 12, 28)
+    today = dt.date.today()
+    last_sunday = today - dt.timedelta(days=today.weekday() + 1)
+    return last_sunday - dt.timedelta(weeks=104) + dt.timedelta(days=1), last_sunday
+
+
+def _upload_panel(W: dict):
+    c1, c2 = st.columns([2, 1])
+    with c2:
+        st.download_button("⬇ Template (CSV)", template_frame("marketing_weekly").to_csv(index=False),
+                           "dsdvc_marketing_weekly_template.csv")
+        st.download_button("⬇ Data dictionary", MARKETING_WEEKLY.dictionary().to_csv(index=False), "dsdvc_data_dictionary.csv")
+        if st.button("Load sample client file (SYNTHETIC)"):
+            from dsdvc.mmm.synthetic import messy_client_export
+            W["raw"], W["raw_name"], W["raw_synthetic"] = messy_client_export(), "sample_client_export.csv", True
+            W.pop("accepted", None)
+    with c1:
+        f = st.file_uploader("Upload the client's weekly export (CSV or Excel)", type=["csv", "xlsx", "xls"], key="wf_upload")
+        if f is not None and f.name != W.get("raw_name"):
+            W["raw"], W["raw_name"], W["raw_synthetic"] = _read_any(f), f.name, False
+            W.pop("accepted", None)
+
+
+def _pull_panel(W: dict):
+    from dsdvc.connectors import credentials as C
+    from dsdvc.connectors.meta_ads import ChannelRules
+    from dsdvc.connectors.pull import pull_weekly
+    stat = C.status()
+    cols = st.columns(4)
+    for col, (k, label) in zip(cols, (("meta", "Meta Ads"), ("ga4", "Google Analytics 4"), ("shopify", "Shopify"))):
+        col.markdown(f"**{label}**<br>{'🟢 connected' if stat[k] else '⚪ not configured'}", unsafe_allow_html=True)
+    demo = cols[3].toggle("Demo accounts (SYNTHETIC)", value=not any(stat.values()),
+                          help="Simulated Meta/GA4/Shopify APIs with planted effects - exercises the real connector code.")
+    if not demo and not any(stat.values()):
+        st.info("No accounts connected. Add credentials as environment variables or Streamlit secrets "
+                "(META_ACCESS_TOKEN + META_AD_ACCOUNT_ID, GA4_PROPERTY_ID + GA4_ACCESS_TOKEN or a service account, "
+                "SHOPIFY_SHOP + SHOPIFY_ACCESS_TOKEN) - see docs/CONNECTORS.md - or switch on demo accounts.")
+        return
+    d0, d1 = _default_range(demo)
+    c1, c2, c3 = st.columns(3)
+    start = c1.date_input("From", d0, key="pull_from")
+    end = c2.date_input("To", d1, key="pull_to")
+    available = [k for k in ("meta", "ga4", "shopify") if demo or stat[k]]
+    sources = c3.multiselect("Sources", available, default=available,
+                             format_func={"meta": "Meta Ads", "ga4": "GA4", "shopify": "Shopify"}.get)
+    with st.expander("Meta channel rules and options"):
+        meta_mode = st.radio("Meta export", ["mmm", "insights"], horizontal=True,
+                             help="mmm = Meta's official Marketing Mix Modeling breakdown (preferred); insights = campaign-level "
+                                  "Insights with campaign names.")
+        rules_df = st.data_editor(W.get("rules_df", pd.DataFrame({"campaign name contains": ["influencer", "creator"],
+                                                                  "channel": ["influencers", "influencers"]})),
+                                  num_rows="dynamic", hide_index=True, key="rules_editor")
+        split = st.checkbox("Split Instagram and Facebook into separate channels", False)
+    outcome = st.selectbox("Outcome of record", ["auto", "shopify", "ga4"],
+                           help="auto = Shopify net sales when available, else GA4 revenue.")
+    extra = st.file_uploader("Other channel spend not covered by the APIs (CSV: date, spend; one file per channel)",
+                             type=["csv"], accept_multiple_files=True, key="pull_extra")
+    if st.button("Pull data", type="primary", disabled=not sources or start >= end):
+        rules = ChannelRules(campaign_contains=[(r[0], r[1]) for r in rules_df.dropna().itertuples(index=False) if r[0] and r[1]],
+                             split_platforms=split)
+        extra_spend = {}
+        for f in extra or []:
+            name = f.name.rsplit(".", 1)[0].lower().replace(" ", "_").removeprefix("spend_")
+            extra_spend[name] = pd.read_csv(f)
+        with st.status("Pulling data…", expanded=True) as box:
+            res, errors = pull_weekly(C.connectors(demo=demo), start, end, sources, meta_mode=meta_mode, rules=rules,
+                                      outcome_source=outcome, extra_spend=extra_spend or None, progress=box.write)
+            box.update(label="Pull finished" if res is not None else "Nothing could be pulled",
+                       state="complete" if res is not None else "error")
+        W["pull_errors"] = errors
+        if res is not None:
+            W["pull_result"] = res
+            W["raw"], W["raw_name"], W["raw_synthetic"] = res.data, f"api_pull_{'_'.join(sources)}_{start}_{end}", demo
+            W["pull_attestation"] = res.attestation_text() + (" [SYNTHETIC demo accounts]" if demo else "")
+            W.pop("accepted", None)
+            W.pop("mapping_for", None)
+    for k, v in W.get("pull_errors", {}).items():
+        badge("DATA_UNAVAILABLE", f"{k}: {v}")
+    res = W.get("pull_result")
+    if res is not None and W.get("raw_name", "").startswith("api_pull"):
+        st.markdown("**Where each column came from**")
+        st.dataframe(pd.DataFrame({"column": list(res.column_sources), "source": list(res.column_sources.values())}),
+                     hide_index=True, width="stretch")
+        for w_ in res.warnings:
+            st.warning(w_)
+        if res.reconciliation is not None and len(res.reconciliation):
+            rec = res.reconciliation
+            fig = go.Figure(go.Scatter(x=rec.date, y=rec.ga4_to_shopify, mode="lines", line=dict(color=SERIES[0], width=2),
+                                       name="GA4 ÷ Shopify"))
+            fig.add_hline(y=1, line_dash="dot", line_color="#8a8985")
+            st.plotly_chart(style(fig.update_layout(title="Revenue reconciliation: GA4 as a share of Shopify (tracking coverage)",
+                                                    yaxis_tickformat=".0%"), 280), width="stretch")
+
+
 def workflow_page():
     st.title("Client workflow")
     st.caption("Brief → Data → Model → Plan → Export. Each step must pass before the next one unlocks.")
@@ -84,21 +180,14 @@ def workflow_page():
     # ------------------------------------------------------------------ 2 data
     with tabs[1]:
         st.subheader("Weekly marketing & sales data")
-        c1, c2 = st.columns([2, 1])
-        with c2:
-            st.download_button("⬇ Template (CSV)", template_frame("marketing_weekly").to_csv(index=False), "dsdvc_marketing_weekly_template.csv")
-            st.download_button("⬇ Data dictionary", MARKETING_WEEKLY.dictionary().to_csv(index=False), "dsdvc_data_dictionary.csv")
-            if st.button("Load sample client file (SYNTHETIC)"):
-                from dsdvc.mmm.synthetic import messy_client_export
-                W["raw"], W["raw_name"], W["raw_synthetic"] = messy_client_export(), "sample_client_export.csv", True
-                W.pop("accepted", None)
-        with c1:
-            f = st.file_uploader("Upload the client's weekly export (CSV or Excel)", type=["csv", "xlsx", "xls"], key="wf_upload")
-            if f is not None and f.name != W.get("raw_name"):
-                W["raw"], W["raw_name"], W["raw_synthetic"] = _read_any(f), f.name, False
-                W.pop("accepted", None)
+        mode = st.radio("Data source", ["Upload a file", "Pull from connected accounts"], horizontal=True,
+                        key="wf_source_mode")
+        if mode == "Pull from connected accounts":
+            _pull_panel(W)
+        else:
+            _upload_panel(W)
         if "raw" not in W:
-            st.info("Upload a file or load the sample to continue.")
+            st.info("Upload a file, load the sample, or pull from connected accounts to continue.")
         else:
             raw = W["raw"]
             if W.get("raw_synthetic"):
@@ -125,7 +214,7 @@ def workflow_page():
             tab.insert(0, "", tab.status.map(CHECK_ICON))
             st.dataframe(tab.drop(columns="status"), width="stretch", hide_index=True)
             st.dataframe(canon.head(8), width="stretch")
-            att = st.text_input("Authorisation", W.get("attestation", ""),
+            att = st.text_input("Authorisation", W.get("attestation") or W.get("pull_attestation", ""),
                                 placeholder="e.g. 'Provided by client marketing team under MSA dated …; contains no personal data'",
                                 help="Required. Recorded with the dataset and printed in every export.")
             if st.button("Accept dataset", type="primary", disabled=sc.status == "BLOCKED" or not att.strip()):

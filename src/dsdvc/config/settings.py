@@ -23,7 +23,17 @@ class Settings(BaseModel):
     meta_content_library_token: str | None = None
     whatsapp_business_token: str | None = None
     whatsapp_business_account_id: str | None = None
-    graph_api_version: str = "v21.0"
+    graph_api_version: str = "v26.0"
+    meta_ad_account_id: str | None = None          # numeric id, without the act_ prefix
+    ga4_property_id: str | None = None
+    ga4_access_token: str | None = None            # short-lived OAuth token, or use a service account file
+    google_application_credentials: str | None = None
+    shopify_shop: str | None = None                # e.g. mybrand.myshopify.com
+    shopify_access_token: str | None = None        # legacy custom app (static shpat_ token)
+    shopify_client_id: str | None = None           # Dev Dashboard app (client-credentials grant)
+    shopify_client_secret: str | None = None
+    shopify_api_version: str = "2026-07"
+    ga4_service_account_json: str | None = None
     anthropic_api_key: str | None = None
     llm_model: str = "claude-opus-5-5"
     synthetic_data_allowed: bool = True
@@ -58,7 +68,17 @@ def get_settings() -> Settings:
         meta_content_library_token=_env("META_CONTENT_LIBRARY_TOKEN"),
         whatsapp_business_token=_env("WHATSAPP_BUSINESS_TOKEN"),
         whatsapp_business_account_id=_env("WHATSAPP_BUSINESS_ACCOUNT_ID"),
-        graph_api_version=_env("META_GRAPH_API_VERSION", "v21.0"),
+        graph_api_version=_env("META_GRAPH_API_VERSION", "v26.0"),
+        meta_ad_account_id=_env("META_AD_ACCOUNT_ID"),
+        ga4_property_id=_env("GA4_PROPERTY_ID"),
+        ga4_access_token=_env("GA4_ACCESS_TOKEN"),
+        google_application_credentials=_env("GOOGLE_APPLICATION_CREDENTIALS"),
+        shopify_shop=_env("SHOPIFY_SHOP"),
+        shopify_access_token=_env("SHOPIFY_ACCESS_TOKEN"),
+        shopify_client_id=_env("SHOPIFY_CLIENT_ID"),
+        shopify_client_secret=_env("SHOPIFY_CLIENT_SECRET"),
+        ga4_service_account_json=_env("GA4_SERVICE_ACCOUNT_JSON"),
+        shopify_api_version=_env("SHOPIFY_API_VERSION", "2026-07"),
         anthropic_api_key=_env("ANTHROPIC_API_KEY"),
         llm_model=_env("DSDVC_LLM_MODEL", "claude-opus-5-5"),
         synthetic_data_allowed=_env("DSDVC_ALLOW_SYNTHETIC", "true").lower() == "true",
