@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dsdvc import MODEL_VERSION, __version__
+from dsdvc.core.reproducibility import stable_hash
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 PLATFORM_COLOR = {"instagram": SERIES[0], "facebook": SERIES[1], "whatsapp": SERIES[2], "external": "#8a8985"}
@@ -94,24 +95,149 @@ def demo_journeys():
     return synthetic_journeys(8000)
 
 
+# Heavy computations are cached by (data key, parameters). Arguments starting with "_" are not
+# hashed by Streamlit; the accompanying *_key string identifies the dataset instead, so a rerun
+# triggered by an unrelated widget costs only a cache lookup.
 @st.cache_resource(show_spinner=False)
-def fit_virality(df: pd.DataFrame, top_pct: float):
+def fit_virality(data_key: str, _df: pd.DataFrame, top_pct: float):
     from dsdvc.content.virality import ViralityPredictor
     vp = ViralityPredictor(top_pct=top_pct)
-    vp.fit(df, data_version="dashboard")
+    vp.fit(_df, data_version=data_key)
     return vp
 
 
 @st.cache_data(show_spinner=False)
+def virality_predictions(data_key: str, top_pct: float, _vp, _recent: pd.DataFrame):
+    return _vp.predict(_recent)
+
+
+@st.cache_resource(show_spinner=False)
 def network(n: int, homophily: float, seed: int):
     from dsdvc.networks.multiplex import synthetic_multiplex
     return synthetic_multiplex(n, 8, homophily, seed=seed)
 
 
+@st.cache_data(show_spinner=False)
+def network_structure(n: int, homophily: float, seed: int):
+    from dsdvc.networks.metrics import structure_report
+    mx = network(n, homophily, seed)
+    return {k: structure_report(g, mx.community) for k, g in mx.layers.items()}
+
+
+@st.cache_data(show_spinner=False)
+def network_layout(n: int, homophily: float, seed: int, layer: str):
+    import networkx as nx
+    mx = network(n, homophily, seed)
+    g = mx.layers[layer].to_undirected() if mx.layers[layer].is_directed() else mx.layers[layer]
+    sub = g.subgraph(list(range(min(400, g.number_of_nodes()))))
+    pos = nx.spring_layout(sub, seed=1, k=0.15)
+    return list(sub.nodes), list(sub.edges()), {int(k): (float(v[0]), float(v[1])) for k, v in pos.items()}
+
+
+@st.cache_data(show_spinner=False)
+def communities(n: int, homophily: float, seed: int, layer: str, method: str):
+    from dsdvc.networks.communities import detect_communities
+    cr = detect_communities(network(n, homophily, seed).layers[layer], method)
+    return {"n": cr.n_communities, "modularity": cr.modularity, "notes": cr.notes, "per": cr.per_community,
+            "bridges": cr.bridges[:10], "isolated": cr.isolated_clusters, "micro": cr.micro_communities}
+
+
+@st.cache_data(show_spinner=False)
+def community_comparison(n: int, homophily: float, seed: int, layer: str):
+    from dsdvc.networks.communities import compare_methods
+    return pd.DataFrame(compare_methods(network(n, homophily, seed).layers[layer]))
+
+
+@st.cache_data(show_spinner=False)
+def stepps_sample(data_key: str, _content: pd.DataFrame):
+    from dsdvc.content.stepps import DIMENSIONS, STEPPSAnalyzer
+    an = STEPPSAnalyzer()
+    sample = _content.head(600).copy()
+    S = np.array([an.analyze(t, m).vector() for t, m in zip(sample.text.fillna(""), sample.get("media_type", "image"))])
+    for k, d in enumerate(DIMENSIONS):
+        sample[d] = S[:, k]
+    cmp = None
+    if {"shares", "views"} <= set(sample.columns):
+        from dsdvc.content.stepps_models import compare_stepps_forms
+        r = compare_stepps_forms(sample[list(DIMENSIONS)].values, (sample.shares / sample.views.clip(lower=1)).values)
+        cmp = {"best_form": r["best_form"], "table": r["table"]}
+    return sample[list(DIMENSIONS)], cmp
+
+
+@st.cache_data(show_spinner=False)
+def copilot_report(data_key: str, text: str, _vp):
+    from dsdvc.content.copilot import ContentCopilot
+    return ContentCopilot(_vp).analyze(caption=text).__dict__
+
+
+@st.cache_data(show_spinner=False)
+def ranked_creators(creators_key: str, content_key: str, keyword: str, _creators: pd.DataFrame, _content):
+    from dsdvc.networks.influencers import score_creators
+    return score_creators(_creators, category=keyword, content=_content)
+
+
+@st.cache_data(show_spinner=False)
+def conversion_fit(data_key: str, _panel: pd.DataFrame):
+    from dsdvc.conversion.model import ConversionModel
+    return ConversionModel().fit(_panel).coefficients_by_platform()
+
+
+@st.cache_data(show_spinner=False)
+def conversion_benchmark(data_key: str, _panel: pd.DataFrame):
+    from dsdvc.conversion.model import benchmark_conversion_models
+    return benchmark_conversion_models(_panel)
+
+
+@st.cache_data(show_spinner=False)
+def churn_fit(data_key: str, _customers: pd.DataFrame):
+    from dsdvc.churn.model import ChurnModel
+    return ChurnModel().fit(_customers).table()
+
+
+@st.cache_data(show_spinner=False)
+def churn_tables(data_key: str, by: str, _customers: pd.DataFrame):
+    from dsdvc.churn.ltv import ltv_by
+    from dsdvc.churn.model import churn_breakdown
+    return churn_breakdown(_customers, by), ltv_by(_customers, by)
+
+
+@st.cache_data(show_spinner=False)
+def forecast_tables(data_key: str, _daily: pd.DataFrame):
+    from dsdvc.forecasting.forecast import Forecaster
+    from dsdvc.forecasting.regime import detect_regime
+    return Forecaster().forecast_frame(_daily), detect_regime(_daily)
+
+
+@st.cache_data(show_spinner=False)
+def forecast_path(data_key: str, metric: str, _daily: pd.DataFrame):
+    from dsdvc.forecasting.forecast import Forecaster
+    fr = Forecaster().forecast(_daily[metric].to_numpy(float), metric)
+    return fr.path, fr.model, fr.model_comparison
+
+
+@st.cache_data(show_spinner=False)
+def bass_calibration(data_key: str, _daily: pd.DataFrame):
+    from dsdvc.calibration.engine import CalibrationEngine
+    e = CalibrationEngine("dashboard")
+    y = _daily.adoptions.to_numpy(float)
+    return pd.concat([e.bass_nls(y).table(), e.bass_mle(y).table(), e.bass_bayesian(y, 3000, 1000).table()])
+
+
+@st.cache_data(show_spinner=False)
+def attributions(data_key: str, _paths: pd.DataFrame):
+    from dsdvc.attribution.models import all_attributions
+    return all_attributions(_paths)
+
+
+UPLOAD_KEYS: dict[str, str] = {}
+
+
 def read_upload(label: str, key: str) -> pd.DataFrame | None:
     f = st.sidebar.file_uploader(label, type=["csv"], key=key)
     if f is None:
+        UPLOAD_KEYS.pop(key, None)
         return None
+    UPLOAD_KEYS[key] = f"upload:{f.name}:{f.size}:{getattr(f, 'file_id', '')}"
     df = pd.read_csv(f)
     for c in ("timestamp", "date"):
         if c in df:
@@ -123,7 +249,8 @@ def read_upload(label: str, key: str) -> pd.DataFrame | None:
 def main():
     st.set_page_config(page_title="DSDVC Marketing Intelligence", layout="wide")
     st.title("DSDVC — Social Diffusion, Virality, Conversion & Marketing Intelligence")
-    st.caption(f"v{__version__} · {MODEL_VERSION} · Decision support, not a vanity-metrics dashboard: "
+    from dsdvc.core.runtime import available_cpus
+    st.caption(f"v{__version__} · {MODEL_VERSION} · {available_cpus()} CPU thread(s) · Decision support, not a vanity-metrics dashboard: "
                "Reach ≠ Engagement ≠ Sharing ≠ Adoption ≠ Conversion ≠ Retention.")
 
     sb = st.sidebar
@@ -164,6 +291,9 @@ def main():
 
     content = content_up if content_up is not None else (demo_content()[0] if synthetic else None)
     content_status = "OBSERVED" if content_up is not None else ("SYNTHETIC" if synthetic else "DATA_UNAVAILABLE")
+
+    def dkey(name: str) -> str:
+        return UPLOAD_KEYS.get(name) or ("synthetic-v1" if synthetic else "none")
     creators = creators_up if creators_up is not None else (demo_content()[1] if synthetic else None)
     daily = daily_up if daily_up is not None else (demo_daily() if synthetic else None)
     panel = panel_up if panel_up is not None else (demo_panel() if synthetic else None)
@@ -206,9 +336,8 @@ def main():
         kpi(r2[2], "Churned share of adopters", summaries.churned / summaries.ever_adopted.clip(lower=1), "{:.1%}")
         kpi(r2[3], "ROI", summaries.roi, "{:.2f}")
         kpi(r2[4], "Platform dependency", summaries.platform_dependency, "{:.0%}")
-        from dsdvc.networks.metrics import structure_report
         mx = network(min(n_agents, 1500), homophily, 0)
-        rep = structure_report(mx.layers["facebook"], mx.community)
+        rep = network_structure(min(n_agents, 1500), homophily, 0)["facebook"]
         r3 = st.columns(3)
         r3[0].metric("Network density (FB layer)", f"{rep['density']:.4f}")
         r3[1].metric("Community fragmentation (modularity)", f"{rep['modularity']:.2f}")
@@ -259,19 +388,14 @@ def main():
     # ---------------- Networks
     with T["Networks"]:
         badge("SYNTHETIC", "Synthetic multiplex prior — replace with authorised aggregate graph data where available")
-        from dsdvc.networks.metrics import structure_report
-        rows = [{"layer": k, **structure_report(g, mx.community)} for k, g in mx.layers.items()]
+        rows = [{"layer": k, **v} for k, v in network_structure(min(n_agents, 1500), homophily, 0).items()]
         st.dataframe(pd.DataFrame(rows).set_index("layer").round(4), width="stretch")
         layer = st.selectbox("Layer to draw", list(mx.layers), key="netlayer")
-        import networkx as nx
-        g = mx.layers[layer].to_undirected() if mx.layers[layer].is_directed() else mx.layers[layer]
-        sub = g.subgraph(list(range(min(400, g.number_of_nodes()))))
-        pos = nx.spring_layout(sub, seed=1, k=0.15)
+        nodes, edges, pos = network_layout(min(n_agents, 1500), homophily, 0, layer)
         ex, ey = [], []
-        for a, b in sub.edges():
+        for a, b in edges:
             ex += [pos[a][0], pos[b][0], None]
             ey += [pos[a][1], pos[b][1], None]
-        nodes = list(sub.nodes)
         comm = [int(mx.community[i]) for i in nodes]
         fig = go.Figure([go.Scatter(x=ex, y=ey, mode="lines", line=dict(color="#d5d4cf", width=0.5), hoverinfo="skip", showlegend=False),
                          go.Scatter(x=[pos[i][0] for i in nodes], y=[pos[i][1] for i in nodes], mode="markers",
@@ -333,7 +457,9 @@ def main():
             from dsdvc.networks.influencers import COLUMN_STATUS, score_creators
             badge("OBSERVED" if creators_up is not None else "SYNTHETIC", "observed vs modelled columns are listed below")
             kw = st.text_input("Category / keywords", "skincare")
-            ranked = score_creators(creators, category=kw, content=content if content is not None and "creator_id" in content else None)
+            use_content = content if content is not None and "creator_id" in content else None
+            ranked = ranked_creators(dkey("creators"), dkey("content") if use_content is not None else "none", kw,
+                                     creators, use_content)
             rank_by = st.radio("Rank by", ["roi_score", "followers", "expected_incremental_conversions", "trust_proxy",
                                            "estimated_influence"], horizontal=True)
             cols = ["creator_id", "platform", "followers", "engagement_rate", "trust_proxy", "niche_relevance",
@@ -364,14 +490,14 @@ def main():
         from dsdvc.networks.communities import compare_methods, detect_communities
         layer = st.selectbox("Layer", list(mx.layers), key="commlayer")
         method = st.selectbox("Algorithm", ["leiden", "louvain", "label_propagation", "spectral", "hdbscan"])
-        cr = detect_communities(mx.layers[layer], method)
-        st.metric("Detected communities", cr.n_communities, help=cr.notes)
-        st.metric("Modularity", f"{cr.modularity:.3f}")
-        st.dataframe(pd.DataFrame(cr.per_community).round(4), width="stretch")
-        st.write("Top bridge accounts (bridging centrality):", cr.bridges[:10])
-        st.write("Isolated clusters:", cr.isolated_clusters, " · micro-communities:", cr.micro_communities)
+        cr = communities(min(n_agents, 1500), homophily, 0, layer, method)
+        st.metric("Detected communities", cr["n"], help=cr["notes"])
+        st.metric("Modularity", f"{cr['modularity']:.3f}")
+        st.dataframe(pd.DataFrame(cr["per"]).round(4), width="stretch")
+        st.write("Top bridge accounts (bridging centrality):", cr["bridges"])
+        st.write("Isolated clusters:", cr["isolated"], " · micro-communities:", cr["micro"])
         if st.checkbox("Compare all algorithms"):
-            st.dataframe(pd.DataFrame(compare_methods(mx.layers[layer])), width="stretch")
+            st.dataframe(community_comparison(min(n_agents, 1500), homophily, 0, layer), width="stretch")
 
     # ---------------- Content / Virality
     vp = None
@@ -380,27 +506,21 @@ def main():
             unavailable("Content", "Upload an authorised content export or enable the synthetic demo.")
         else:
             badge(content_status)
-            from dsdvc.content.stepps import DIMENSIONS, STEPPSAnalyzer
-            an = STEPPSAnalyzer()
-            sample = content.head(600).copy()
-            S = np.array([an.analyze(t, m).vector() for t, m in zip(sample.text.fillna(""), sample.get("media_type", "image"))])
-            for k, d in enumerate(DIMENSIONS):
-                sample[d] = S[:, k]
+            from dsdvc.content.stepps import DIMENSIONS
+            sample, cmp = stepps_sample(dkey("content"), content)
             st.plotly_chart(style(px.bar(sample[list(DIMENSIONS)].mean().reset_index(name="mean score").rename(columns={"index": "dimension"}),
                                          x="dimension", y="mean score", color_discrete_sequence=[SERIES[0]],
                                          title="Mean STEPPS profile (lexicon coder; hypothesis, not guarantee)")),
                             width="stretch")
-            if {"shares", "views"} <= set(sample.columns):
-                from dsdvc.content.stepps_models import compare_stepps_forms
-                cmp = compare_stepps_forms(sample[list(DIMENSIONS)].values, (sample.shares / sample.views.clip(lower=1)).values)
+            if cmp is not None:
                 badge("ESTIMATED", f"best-supported form: {cmp['best_form']}")
                 st.dataframe(cmp["table"].round(5), width="stretch")
             st.subheader("Viral Content Copilot")
             txt = st.text_area("Concept / caption / script", "My journey with acne: 3 tips under ₹500 that finally worked. Tag a friend!")
-            from dsdvc.content.copilot import ContentCopilot
+            from types import SimpleNamespace
             if {"shares", "views", "timestamp", "followers"} <= set(content.columns) and len(content) >= 300:
-                vp = fit_virality(content, 0.05)
-            rep = ContentCopilot(vp).analyze(caption=txt)
+                vp = fit_virality(dkey("content"), content, 0.05)
+            rep = SimpleNamespace(**copilot_report(dkey("content") if vp is not None else "none", txt, vp))
             if rep.viral:
                 badge("PREDICTED", rep.language_note)
                 st.write(f"Estimated probability of top-5% performance: **{rep.viral['prediction']:.0%}** "
@@ -418,7 +538,7 @@ def main():
             unavailable("Virality model", "Needs ≥300 content items with views, shares, followers and timestamps.")
         else:
             top = st.select_slider("Viral = top x% of comparable content", [0.01, 0.05, 0.10], 0.05)
-            vp = fit_virality(content, top)
+            vp = fit_virality(dkey("content"), content, top)
             badge("PREDICTED", vp.report["viral_definition"])
             st.dataframe(vp.report["benchmarks"].round(4), width="stretch")
             st.write("Learned ensemble weights:", vp.report["weights"], "· tree backend:", vp.report["tree_backend"])
@@ -430,7 +550,7 @@ def main():
             st.plotly_chart(style(fig.update_layout(title="Calibration curve", xaxis_title="predicted", yaxis_title="observed")),
                             width="stretch")
             recent = content.sort_values("timestamp").tail(150)
-            preds = vp.predict(recent)
+            preds = virality_predictions(dkey("content"), top, vp, recent)
             board = pd.DataFrame([{"content_id": p["content_id"], "p_viral": p["viral"]["prediction"],
                                    "p_viral_low": p["viral"]["lower"], "p_viral_high": p["viral"]["upper"],
                                    "confidence": p["viral"]["confidence"],
@@ -460,28 +580,25 @@ def main():
                         "community_fit, product_fit, platform, converted.")
         else:
             badge("ESTIMATED" if panel_up is not None else "SYNTHETIC")
-            from dsdvc.conversion.model import ConversionModel, benchmark_conversion_models
-            cm = ConversionModel().fit(panel)
-            coef = cm.coefficients_by_platform()
+            coef = conversion_fit(dkey("panel"), panel)
             fig = px.bar(coef, x="feature", y="beta", color="platform", barmode="group", color_discrete_map=PLATFORM_COLOR,
                          error_y=coef.ci_high - coef.beta, title="Platform-specific conversion coefficients (90% CI)")
             st.plotly_chart(style(fig), width="stretch")
             if st.checkbox("Benchmark vs pooled logistic and gradient boosting (5-fold CV)"):
-                st.dataframe(benchmark_conversion_models(panel).round(4), width="stretch")
+                st.dataframe(conversion_benchmark(dkey("panel"), panel).round(4), width="stretch")
 
     with T["Churn"]:
         if panel is None:
             unavailable("Customer panel", "Upload customer data with churn outcomes.")
         else:
             badge("ESTIMATED" if panel_up is not None else "SYNTHETIC")
-            from dsdvc.churn.ltv import ltv_by
-            from dsdvc.churn.model import ChurnModel, churn_breakdown
             cust = panel[panel.converted]
-            st.dataframe(ChurnModel().fit(cust).table().round(3), width="stretch")
+            st.dataframe(churn_fit(dkey("panel"), cust).round(3), width="stretch")
             by = st.selectbox("Churn / LTV by", ["platform", "acquisition_channel", "community", "influencer"])
+            churn_tab, ltv_tab = churn_tables(dkey("panel"), by, cust)
             c1, c2 = st.columns(2)
-            c1.dataframe(churn_breakdown(cust, by).round(3))
-            c2.dataframe(ltv_by(cust, by).round(1))
+            c1.dataframe(churn_tab.round(3))
+            c2.dataframe(ltv_tab.round(1))
 
     # ---------------- Competition
     with T["Competition"]:
@@ -520,12 +637,12 @@ def main():
         else:
             badge("PREDICTED", "observed history" if daily_up is not None else "SYNTHETIC history")
             from dsdvc.forecasting.early_warning import scan
-            from dsdvc.forecasting.forecast import Forecaster
-            from dsdvc.forecasting.regime import detect_regime
-            F = Forecaster()
-            st.dataframe(F.forecast_frame(daily).round(1), width="stretch")
+            frame, reg = forecast_tables(dkey("daily"), daily)
+            st.dataframe(frame.round(1), width="stretch")
             m = st.selectbox("Path", [c for c in ("adoptions", "engagement", "shares", "conversions", "churn", "revenue") if c in daily])
-            fr = F.forecast(daily[m].to_numpy(float), m)
+            from types import SimpleNamespace
+            fp, fm, fc = forecast_path(dkey("daily"), m, daily)
+            fr = SimpleNamespace(path=fp, model=fm, model_comparison=fc)
             hist = daily[[m]].reset_index(drop=True)
             x0 = len(hist)
             fig = go.Figure([go.Scatter(x=list(range(x0)), y=hist[m], mode="lines", name="history", line=dict(color="#52514e", width=2)),
@@ -536,7 +653,6 @@ def main():
                                         name=f"forecast ({fr.model})", line=dict(color=SERIES[0], width=2))])
             st.plotly_chart(style(fig.update_layout(title=f"{m}: 90-day forecast")), width="stretch")
             st.dataframe(fr.model_comparison.round(3), width="stretch")
-            reg = detect_regime(daily)
             st.write(f"**Regime:** {reg['regime']}")
             st.json(reg["evidence"])
             acq_by_platform = {k: v for k, v in runs[0]["summary"]["acquisition_share_by_platform"].items() if k != "external"}
@@ -562,8 +678,8 @@ def main():
         paths = journeys if journeys is not None else runs[0]["paths"]
         badge("OBSERVED" if journeys_up is not None else ("SYNTHETIC" if journeys is not None else "SIMULATED"),
               "Attributed conversions are NOT incremental conversions")
-        from dsdvc.attribution.models import all_attributions, incrementality_test
-        att = all_attributions(paths)
+        from dsdvc.attribution.models import incrementality_test
+        att = attributions(dkey("paths") if journeys is not None else f"sim:{stable_hash(cfg_items)}:{n_seeds}", paths)
         m = att.reset_index(names="channel").melt("channel", var_name="model", value_name="attributed")
         st.plotly_chart(style(px.bar(m, x="channel", y="attributed", color="model", barmode="group",
                                      color_discrete_sequence=SERIES, title="Attributed conversions by model")),
@@ -582,10 +698,7 @@ def main():
             badge("PRIOR")
         else:
             badge("ESTIMATED" if daily_up is not None else "SYNTHETIC")
-            e = CalibrationEngine("dashboard")
-            y = daily.adoptions.to_numpy(float)
-            st.dataframe(pd.concat([e.bass_nls(y).table(), e.bass_mle(y).table(), e.bass_bayesian(y, 3000, 1000).table()]).round(5),
-                         width="stretch")
+            st.dataframe(bass_calibration(dkey("daily"), daily).round(5), width="stretch")
         st.subheader("Platform rate posteriors (Beta-Binomial)")
         from pathlib import Path
         sample = Path(__file__).resolve().parents[3] / "legacy" / "dsdvc_mp_v3" / "sample_platform_observations.csv"
