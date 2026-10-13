@@ -33,6 +33,7 @@ from dsdvc.content.stepps import DIMENSIONS, STEPPSAnalyzer
 from dsdvc.content.velocity import early_features
 from dsdvc.core.literature import cites
 from dsdvc.core.prediction import Explanation, Prediction, confidence_label
+from dsdvc.core.runtime import available_cpus
 from dsdvc.validation import metrics as VM
 
 SIZE_TIERS = [0, 10_000, 100_000, 1_000_000, np.inf]
@@ -102,6 +103,7 @@ def _tree_model(seed: int):
     try:
         import lightgbm as lgb
         return lgb.LGBMClassifier(n_estimators=300, learning_rate=0.04, num_leaves=15, min_child_samples=20,
+                                  n_jobs=available_cpus(),
                                   subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
                                   random_state=seed, verbose=-1), "lightgbm"
     except Exception:  # noqa: BLE001
@@ -226,25 +228,25 @@ class ViralityPredictor:
         lo, hi = stats.beta.ppf([a, 1 - a], 0.5 + pos, 0.5 + len(idx) - pos)
         return float(lo), float(hi), int(pairs[:, 1].sum())
 
-    def _explain(self, X: pd.DataFrame) -> Explanation:
+    def _contributions(self, X: pd.DataFrame) -> tuple[np.ndarray, str]:
+        """Per-row feature contributions for all rows at once (SHAP if installed, else logistic)."""
         try:
             import shap
             if self._shap is None:
                 self._shap = shap.TreeExplainer(self.tree)
             sv = self._shap.shap_values(X)
-            sv = sv[1] if isinstance(sv, list) else sv
-            sv = np.asarray(sv)
+            sv = np.asarray(sv[1] if isinstance(sv, list) else sv)
             if sv.ndim == 3:
                 sv = sv[..., 1]
-            contrib = dict(zip(self._feature_names, sv[0].tolist()))
-            method = "SHAP (tree model, log-odds)"
+            return sv, "SHAP (tree model, log-odds)"
         except Exception:  # noqa: BLE001
-            lr = self.logit[-1]
-            sc = self.logit[0]
-            z = (X.iloc[0] - sc.mean_) / sc.scale_
-            contrib = dict(zip(self._feature_names, (lr.coef_[0] * z).tolist()))
-            method = "logistic coefficient x standardized value"
-        return Explanation.from_contributions(contrib, method)
+            lr, sc = self.logit[-1], self.logit[0]
+            Z = (X.to_numpy(dtype=float) - sc.mean_) / sc.scale_
+            return Z * lr.coef_[0][None, :], "logistic coefficient x standardized value"
+
+    def _explain(self, X: pd.DataFrame) -> Explanation:
+        C, method = self._contributions(X.iloc[[0]])
+        return Explanation.from_contributions(dict(zip(self._feature_names, C[0].tolist())), method)
 
     def predict(self, df: pd.DataFrame, data_quality: float = 0.7) -> list[dict]:
         if not self.fitted:
@@ -254,21 +256,23 @@ class ViralityPredictor:
         out = []
         has_early = self.temporal is not None and all(c in df for c in [f"{self.outcome}_1h"])
         Xe = pd.concat([X, early_features(df, self.horizon_h, self.outcome)], axis=1)[self.temporal_cols] if has_early else None
+        # batched model calls (one call per model, not per row)
+        members_all = {"logistic": self.logit.predict_proba(X)[:, 1], "tree": self.tree.predict_proba(X)[:, 1]}
+        if "temporal" in self.weights and Xe is not None:
+            members_all["temporal"] = self.temporal.predict_proba(Xe)[:, 1]
+        ws = {k: self.weights[k] for k in members_all}
+        tot = sum(ws.values()) or 1
+        raw_all = sum(members_all[k] * ws[k] / tot for k in members_all)
+        p_all = self.calibrator.predict(raw_all)
+        contrib_all, expl_method = self._contributions(X)
+        reg_all = {t: reg.predict(X) for t, (reg, _, _) in self.regressors.items()}
         for i in range(len(df)):
-            xi = X.iloc[[i]]
-            members = {"logistic": float(self.logit.predict_proba(xi)[0, 1]),
-                       "tree": float(self.tree.predict_proba(xi)[0, 1])}
-            if "temporal" in self.weights:
-                if Xe is not None:
-                    members["temporal"] = float(self.temporal.predict_proba(Xe.iloc[[i]])[0, 1])
-            ws = {k: self.weights[k] for k in members}
-            tot = sum(ws.values()) or 1
-            raw = sum(members[k] * ws[k] / tot for k in members)
-            p = float(self.calibrator.predict([raw])[0])
+            members = {k: float(v[i]) for k, v in members_all.items()}
+            p = float(p_all[i])
             lo, hi, _ = self._local_interval(p)
             spread = float(np.std(list(members.values())))
             agreement = float(np.clip(1 - spread / 0.25, 0, 1))
-            expl = self._explain(xi)
+            expl = Explanation.from_contributions(dict(zip(self._feature_names, contrib_all[i].tolist())), expl_method)
             conf = confidence_label(hi - lo, data_quality, agreement)
             pred = Prediction(target="p_viral_top_pct", prediction=p, lower=min(lo, p), upper=max(hi, p),
                               confidence=conf, data_quality=data_quality, model_agreement=agreement,
@@ -279,7 +283,7 @@ class ViralityPredictor:
                               extra={"members": members, "used_temporal": "temporal" in members})
             expected = {}
             for t, (reg, lo_r, hi_r) in self.regressors.items():
-                mu = float(reg.predict(xi)[0])
+                mu = float(reg_all[t][i])
                 if t in ("views", "shares", "conversions"):
                     expected[f"expected_{t}"] = {"prediction": float(np.expm1(mu)), "lower": float(np.expm1(mu + lo_r)),
                                                  "upper": float(np.expm1(mu + hi_r))}
