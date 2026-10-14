@@ -19,7 +19,9 @@ a workspace.
   (`dsdvc/tenancy/access.py`). Unknown and forbidden workspaces both return *not found*, so IDs can't be probed.
 * **Cross-references are refused.** A dataset or model run from one workspace can't be fitted, planned or exported
   from another, even by an organisation admin acting in the wrong workspace.
-* **Files** are stored under `ws_<id>/`. Loading refuses any path outside the row's own workspace directory.
+* **Dataset files** are stored in object storage (or on local disk in development) under `ws_<id>/`. Reads are
+  refused outside the dataset's own workspace prefix and bucket, and the bytes must match the SHA-256 recorded at
+  onboarding, so a tampered or swapped file is rejected. Objects are private and server-side encrypted.
 * **Caches and in-memory model runs** are keyed by workspace. Dashboard state is kept per workspace, so switching
   client never carries data across.
 * **Connector credentials are per client** and never inherited:
@@ -99,5 +101,6 @@ are added, nothing is dropped, and the database is then stamped with the current
 as a deploy step and back up PostgreSQL first.
 
 ## Not yet included
-SCIM user provisioning, SAML (OIDC covers Google, Entra, Okta, Auth0 and Keycloak), per-workspace encryption keys,
+SCIM user provisioning, SAML (OIDC covers Google, Entra, Okta, Auth0 and Keycloak), per-workspace encryption keys
+(today one bucket key, `S3_KMS_KEY_ID`, covers all workspaces),
 and data-retention/deletion automation. These are the next items for enterprise procurement and DPDP/GDPR requests.

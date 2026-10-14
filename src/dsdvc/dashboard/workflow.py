@@ -84,7 +84,13 @@ def _reopen_panel(W: dict):
             pick = st.selectbox("Dataset", list(opts), format_func=opts.get, key="reopen_pick")
             if st.button("Open dataset"):
                 r = next(x for x in rows if x.id == pick)
-                W["accepted"] = {"df": load_dataset(r), "sha": r.sha256, "rows": r.rows, "status": r.status, "id": r.id,
+                from dsdvc.storage import IntegrityError, StorageError
+                try:
+                    df_r = load_dataset(r)
+                except (StorageError, IntegrityError, PermissionError) as e:
+                    st.error(f"Could not open {r.filename}: {e}")
+                    return
+                W["accepted"] = {"df": df_r, "sha": r.sha256, "rows": r.rows, "status": r.status, "id": r.id,
                                  "filename": r.filename, "synthetic": "SYNTHETIC" in (r.attestation or "") or
                                  r.filename == "sample_client_export.csv"}
                 W["attestation"] = r.attestation
@@ -265,9 +271,14 @@ def workflow_page():
                 from dsdvc.database.models import SessionLocal, init_db
                 from dsdvc.onboarding.workspace import save_dataset
                 init_db()
+                from dsdvc.storage import StorageError
                 with SessionLocal() as db:
-                    row = save_dataset(db, df=canon, dataset="marketing_weekly", filename=W["raw_name"], mapping=mapping,
-                                       scorecard=sc, attestation=att, project_id=current().ws_id, user_id=current().user_id)
+                    try:
+                        row = save_dataset(db, df=canon, dataset="marketing_weekly", filename=W["raw_name"], mapping=mapping,
+                                           scorecard=sc, attestation=att, project_id=current().ws_id, user_id=current().user_id)
+                    except StorageError as e:
+                        st.error(f"The dataset could not be stored, so it was not accepted: {e}")
+                        st.stop()
                     W["accepted"] = {"df": canon, "sha": row.sha256, "rows": len(canon), "status": sc.status, "id": row.id,
                                      "filename": W["raw_name"], "synthetic": W.get("raw_synthetic", False)}
                 W["attestation"] = att

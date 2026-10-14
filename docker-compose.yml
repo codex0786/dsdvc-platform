@@ -25,6 +25,19 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-dsdvc-secret}
     volumes: [minio:/data]
     ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 10
+  minio-init:            # creates the private dataset bucket once
+    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    depends_on: {minio: {condition: service_healthy}}
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-dsdvc} $${MINIO_ROOT_PASSWORD:-dsdvc-secret} &&
+      mc mb --ignore-existing local/dsdvc-datasets && mc anonymous set none local/dsdvc-datasets"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsdvc}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-dsdvc-secret}
   api:
     build: .
     env_file: [.env]
@@ -33,9 +46,14 @@ services:
       REDIS_URL: redis://redis:6379/0
       MLFLOW_TRACKING_URI: http://mlflow:5000
       S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: dsdvc-datasets
+      S3_SSE: none            # MinIO needs a KMS for SSE; enable one in production or use a managed bucket
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-dsdvc}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-dsdvc-secret}
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
     ports: ["8000:8000"]
   dashboard:
     build: .
@@ -43,6 +61,11 @@ services:
     command: ["streamlit", "run", "dashboard/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
     environment:
       DATABASE_URL: postgresql+psycopg://dsdvc:${POSTGRES_PASSWORD:-dsdvc}@db:5432/dsdvc
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: dsdvc-datasets
+      S3_SSE: none            # MinIO needs a KMS for SSE; enable one in production or use a managed bucket
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-dsdvc}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-dsdvc-secret}
     depends_on: [api]
     ports: ["8501:8501"]
 volumes:

@@ -71,6 +71,16 @@ def admin_page():
                    f"variables `WS_{ctx.ws_slug.upper()}_META_ACCESS_TOKEN`, … They are never shared with other workspaces"
                    + (" (single-tenant mode is ON: global credentials are also used)." if single_tenant() else "."))
 
+        st.markdown("**Dataset storage**")
+        from dsdvc import storage
+        info = storage.describe()
+        if info["durable"]:
+            st.success(f"Object storage: `{info['location']}` ({info['endpoint']}), encryption: {info['encryption']}. "
+                       f"This client's files live under `ws_{ctx.ws_id}/`.")
+        else:
+            st.warning("Datasets are on this server's local disk, which is wiped when a cloud container restarts. "
+                       "Set `S3_BUCKET` and credentials to keep them in object storage (docs/DEPLOYMENT.md).")
+
         st.markdown("**Audit log**")
         rows = db.scalars(select(AuditLog).where(AuditLog.project_id == ctx.ws_id).order_by(AuditLog.created_at.desc()).limit(200)).all()
         emails = {u.id: u.email for u in db.scalars(select(User).where(User.id.in_({r.user_id for r in rows if r.user_id}))).all()}

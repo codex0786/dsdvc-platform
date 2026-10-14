@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 PIP ?= .venv/bin/pip
 
-.PHONY: venv install test test-fast api dashboard legacy-v3 legacy-v2 docker-up docker-down admin-key demo
+.PHONY: storage-status migrate-storage venv install test test-fast api dashboard legacy-v3 legacy-v2 docker-up docker-down admin-key demo
 
 venv:
 	python3 -m venv .venv
@@ -38,3 +38,9 @@ docker-up:
 
 docker-down:
 	docker compose down
+
+storage-status:
+	$(PY) -m dsdvc.storage status
+
+migrate-storage:   # copy locally stored datasets into S3_BUCKET (local files are kept)
+	$(PY) -m dsdvc.storage migrate

@@ -16,15 +16,16 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from dsdvc import MODEL_VERSION, SIMULATION_VERSION, __version__
+from dsdvc import MODEL_VERSION, SIMULATION_VERSION, __version__, storage
 from dsdvc.config.settings import get_settings
 from dsdvc.core.literature import LITERATURE
 from dsdvc.core.observability import METRICS, Cache, log_to_mlflow
 from dsdvc.core.reproducibility import json_safe
+from dsdvc.storage import IntegrityError, StorageError
 from dsdvc.database import auth as A
 from dsdvc.database.models import (AuditLog, ExperimentRow, Organization, PredictionRow, Project,
                                    ResearchProjectMemory, SessionLocal, SimulationRunRow, User, init_db)
@@ -125,9 +126,19 @@ def in_workspace(min_role: str = "viewer"):
 
 
 # ------------------------------------------------------------------ public
+@app.exception_handler(StorageError)
+def _storage_unavailable(_req, e: StorageError):
+    return JSONResponse({"detail": f"dataset storage unavailable: {e}"}, status_code=503)
+
+
+@app.exception_handler(IntegrityError)
+def _storage_integrity(_req, e: IntegrityError):
+    return JSONResponse({"detail": str(e)}, status_code=409)
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": __version__, **meta()}
+    return {"status": "ok", "version": __version__, "dataset_storage": storage.describe()["backend"], **meta()}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
